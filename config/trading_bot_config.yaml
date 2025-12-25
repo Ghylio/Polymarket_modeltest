@@ -1,0 +1,22 @@
+# Trading bot runtime defaults
+max_evals_per_market_per_sec: 1.0
+global_max_evals_per_sec: 50.0
+min_ticks_change_to_recalc: 1.0
+api_backoff_base_ms: 250
+api_backoff_max_ms: 10000
+stale_book_timeout_sec: 30
+stale_trade_timeout_sec: 120
+# Market filters
+min_24h_volume: 0.0
+max_spread_abs: 0.1
+max_spread_pct: 0.25
+min_top_of_book_depth: 0.0
+min_trades_last_24h: 0
+skip_if_rules_ambiguous: true
+rules_min_length: 40
+ambiguous_keywords:
+  - subjective
+  - opinion
+  - criteria
+  - discretion
+skip_if_time_to_resolve_lt: 600
