@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from data.build_snapshots import HAS_PARQUET, SnapshotBuilder
+from sentiment.store import DocumentStore
 
 
 class SnapshotBuilderTests(unittest.TestCase):
@@ -81,6 +82,97 @@ class SnapshotBuilderTests(unittest.TestCase):
             self.assertTrue(out_path.exists())
             loaded = pd.read_parquet(out_path)
             self.assertEqual(len(loaded), len(dataset))
+
+    def test_sentiment_store_leakage_guard(self):
+        resolution_time = datetime(2024, 1, 10, 12, 0, 0)
+        market = self._sample_market(outcome="YES", market_id="m4")
+        trades = self._sample_trades(resolution_time)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = DocumentStore(Path(tmpdir) / "sentiment.db")
+            snapshot_ts = resolution_time - timedelta(hours=1)
+            store.upsert_documents(
+                [
+                    {
+                        "provider": "test",
+                        "doc_id": "d1",
+                        "market_id": "m4",
+                        "title": "good news",
+                        "text": "good",
+                        "published_ts": int((snapshot_ts - timedelta(minutes=30)).timestamp()),
+                        "sentiment_score": 0.9,
+                    },
+                    {
+                        "provider": "test",
+                        "doc_id": "d_future",
+                        "market_id": "m4",
+                        "title": "future",
+                        "text": "future",
+                        "published_ts": int((snapshot_ts + timedelta(minutes=5)).timestamp()),
+                        "sentiment_score": 0.1,
+                    },
+                ]
+            )
+
+            builder = SnapshotBuilder(
+                fetcher=None,
+                use_sentiment=True,
+                sentiment_store=store,
+                allow_online_sentiment_fetch=False,
+            )
+
+            dataset = builder.build_snapshots([market], {"m4": trades})
+            one_hour_row = dataset.loc[dataset["time_bucket"] == "1h"].iloc[0]
+            self.assertAlmostEqual(one_hour_row["doc_count_1h"], 1.0)
+            self.assertAlmostEqual(one_hour_row["sent_mean_1h"], 0.9)
+
+    def test_missing_sentiment_fills_nan(self):
+        resolution_time = datetime(2024, 1, 10, 12, 0, 0)
+        market = self._sample_market(outcome="YES", market_id="m5")
+        trades = self._sample_trades(resolution_time)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = DocumentStore(Path(tmpdir) / "sentiment.db")
+            builder = SnapshotBuilder(
+                fetcher=None,
+                use_sentiment=True,
+                sentiment_store=store,
+                allow_online_sentiment_fetch=False,
+            )
+
+            dataset = builder.build_snapshots([market], {"m5": trades})
+            row = dataset.loc[dataset["time_bucket"] == "1h"].iloc[0]
+            self.assertTrue(pd.isna(row["sent_mean_1h"]))
+            self.assertTrue(pd.isna(row["sent_mean_24h"]))
+
+    def test_allow_online_sentiment_fetch_toggle(self):
+        resolution_time = datetime(2024, 1, 10, 12, 0, 0)
+        market = self._sample_market(outcome="YES", market_id="m6")
+        trades = self._sample_trades(resolution_time)
+
+        class DummyBuilder:
+            def build_features(self, market, as_of):
+                return {"sent_mean_1h": 0.4, "sent_mean_24h": 0.1, "sent_trend": 0.3}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = DocumentStore(Path(tmpdir) / "sentiment.db")
+            builder = SnapshotBuilder(
+                fetcher=None,
+                use_sentiment=True,
+                sentiment_store=store,
+                allow_online_sentiment_fetch=False,
+            )
+            builder.sentiment_builder = DummyBuilder()
+
+            dataset_no_online = builder.build_snapshots([market], {"m6": trades})
+            row_no_online = dataset_no_online.loc[dataset_no_online["time_bucket"] == "1h"].iloc[0]
+            self.assertTrue(pd.isna(row_no_online["sent_mean_1h"]))
+
+            builder.allow_online_sentiment_fetch = True
+            dataset_online = builder.build_snapshots([market], {"m6": trades})
+            row_online = dataset_online.loc[dataset_online["time_bucket"] == "1h"].iloc[0]
+            self.assertAlmostEqual(row_online["sent_mean_1h"], 0.4)
+
 
 
 if __name__ == "__main__":

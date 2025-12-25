@@ -10,10 +10,11 @@ from the live predictor to keep feature parity across training and inference.
 from __future__ import annotations
 
 import argparse
+import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ import pandas as pd
 from data.sentiment_config import load_sentiment_config
 from data.sentiment_features import (
     SENTIMENT_COLUMNS,
+    SENTIMENT_WINDOWS,
     SentimentFeatureBuilder,
     SentimentScorer,
     canonicalize_sentiment_features,
@@ -28,6 +30,7 @@ from data.sentiment_features import (
 from data.sentiment_providers import build_providers_from_config
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import MarketFeatureExtractor
+from sentiment.store import DocumentStore, aggregate_scores
 
 try:  # Parquet dependency is optional at runtime
     import pyarrow  # noqa: F401
@@ -55,12 +58,22 @@ class SnapshotBuilder:
     )
     schema_version: str = "snapshot_v1"
     use_sentiment: bool = True
+    sentiment_db_path: Path = Path("data/sentiment.db")
+    allow_online_sentiment_fetch: bool = False
+    sentiment_store: Optional[DocumentStore] = None
 
     def __post_init__(self):
+        self.logger = logging.getLogger(__name__)
         self.fetcher = self.fetcher or PolymarketFetcher(verbose=False)
         self.feature_extractor = MarketFeatureExtractor()
         cfg = load_sentiment_config()
         self.use_sentiment = bool(cfg.get("sentiment", {}).get("enabled", False)) and self.use_sentiment
+        self.sentiment_coverage: Tuple[int, int] = (0, 0)  # (windows_with_docs, total_windows)
+        self.sentiment_store = self.sentiment_store or (
+            DocumentStore(self.sentiment_db_path) if self.use_sentiment else None
+        )
+        self.allow_online_sentiment_fetch = bool(self.allow_online_sentiment_fetch)
+
         if self.use_sentiment:
             providers = build_providers_from_config(cfg)
             scorer = SentimentScorer(model_name=cfg.get("sentiment", {}).get("model"))
@@ -115,6 +128,15 @@ class SnapshotBuilder:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
+        if self.use_sentiment and self.sentiment_coverage[1] > 0:
+            with_docs, total = self.sentiment_coverage
+            coverage_pct = 100.0 * with_docs / float(total)
+            self.logger.info(
+                "Sentiment coverage: %.1f%% windows had docs (\%s/%s)",
+                coverage_pct,
+                with_docs,
+                total,
+            )
         return df.sort_values(["market_id", "snapshot_ts"]).reset_index(drop=True)
 
     def fetch_and_build(
@@ -196,11 +218,9 @@ class SnapshotBuilder:
             feature_dict = dict(zip(feature_names, feature_vector.tolist()))
 
             sentiment_features: Dict[str, float] = {}
-            if getattr(self, "sentiment_builder", None):
-                sentiment_features = canonicalize_sentiment_features(
-                    self.sentiment_builder.build_features(
-                        market=market, as_of=pd.to_datetime(snapshot_ts)
-                    )
+            if self.use_sentiment:
+                sentiment_features = self._sentiment_features_from_store(
+                    market_id=market_id, market=market, snapshot_ts=pd.to_datetime(snapshot_ts)
                 )
             else:
                 sentiment_features = canonicalize_sentiment_features({})
@@ -294,6 +314,15 @@ class SnapshotBuilder:
                 return 0.0
         return 0.0
 
+    def _window_delta(self, label: str) -> timedelta:
+        if label.endswith("h"):
+            hours = int(label.replace("h", ""))
+            return timedelta(hours=hours)
+        if label.endswith("d"):
+            days = int(label.replace("d", ""))
+            return timedelta(days=days)
+        raise ValueError(f"Unknown sentiment window label: {label}")
+
     def _bucket_label(self, bucket: timedelta) -> str:
         hours = int(bucket.total_seconds() // 3600)
         days, remainder = divmod(hours, 24)
@@ -305,6 +334,62 @@ class SnapshotBuilder:
         market_copy = dict(market)
         market_copy["outcomePrices"] = [price_hint, 1 - price_hint]
         return self.feature_extractor.extract_market_features(market_copy)
+
+    def _sentiment_features_from_store(
+        self, market_id: str, market: Dict, snapshot_ts: datetime
+    ) -> Dict[str, float]:
+        # Prefer local store; optionally backfill via online providers
+        features: Dict[str, float] = {}
+        total_windows = 0
+        windows_with_docs = 0
+
+        if self.sentiment_store:
+            for label in SENTIMENT_WINDOWS:
+                delta = self._window_delta(label)
+                total_windows += 1
+                start_ts = int((snapshot_ts - delta).timestamp())
+                end_ts = int(snapshot_ts.timestamp())
+                docs = self.sentiment_store.fetch_docs(
+                    market_id=market_id, start_ts=start_ts, end_ts=end_ts
+                )
+                scores = [
+                    row["sentiment_score"]
+                    for row in docs
+                    if row["sentiment_score"] is not None
+                    and row["published_ts"] is not None
+                    and int(row["published_ts"]) <= end_ts
+                ]
+                stats = aggregate_scores(scores)
+                features[f"sent_mean_{label}"] = stats["mean"]
+                features[f"sent_std_{label}"] = stats["std"]
+                features[f"doc_count_{label}"] = stats["count"]
+                if stats["count"]:
+                    windows_with_docs += 1
+
+            features["sent_trend"] = features.get("sent_mean_1h", np.nan) - features.get(
+                "sent_mean_24h", np.nan
+            )
+
+        missing_windows = [
+            label for label in SENTIMENT_COLUMNS if np.isnan(features.get(label, np.nan))
+        ]
+        if (
+            self.allow_online_sentiment_fetch
+            and getattr(self, "sentiment_builder", None)
+            and missing_windows
+        ):
+            try:
+                online_features = canonicalize_sentiment_features(
+                    self.sentiment_builder.build_features(market=market, as_of=snapshot_ts)
+                )
+                features.update({k: v for k, v in online_features.items() if k in SENTIMENT_COLUMNS})
+            except Exception as exc:  # pragma: no cover - defensive online path
+                self.logger.warning("Online sentiment backfill failed: %s", exc)
+
+        with_docs, total = self.sentiment_coverage
+        self.sentiment_coverage = (with_docs + windows_with_docs, total + total_windows)
+
+        return canonicalize_sentiment_features(features)
 
     def _fetch_resolved_markets(
         self, limit: int = 50, min_volume: float = 0
@@ -343,10 +428,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=60,
         help="Minute fidelity for price history when fetching remotely",
     )
+    parser.add_argument(
+        "--sentiment-db",
+        type=Path,
+        default=Path("data/sentiment.db"),
+        help="Path to local sentiment SQLite database",
+    )
+    parser.add_argument(
+        "--allow_online_sentiment_fetch",
+        action="store_true",
+        help="Allow online sentiment provider fetch if local store missing",
+    )
 
     args = parser.parse_args(argv)
 
-    builder = SnapshotBuilder()
+    builder = SnapshotBuilder(
+        sentiment_db_path=args.sentiment_db,
+        allow_online_sentiment_fetch=args.allow_online_sentiment_fetch,
+    )
     dataset = builder.fetch_and_build(
         limit=args.limit, min_volume=args.min_volume, fidelity=args.fidelity
     )

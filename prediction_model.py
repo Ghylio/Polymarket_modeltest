@@ -27,6 +27,7 @@ from data.sentiment_features import (
     canonicalize_sentiment_features,
 )
 from data.sentiment_providers import build_providers_from_config
+from sentiment.store import DocumentStore
 from data.snapshot_dataset import SnapshotDatasetLoader
 from metrics.logger import MetricsLogger
 import warnings
@@ -816,9 +817,11 @@ class PolymarketPredictor:
         # Sentiment runtime controls
         self.sentiment_enabled = False
         self.sentiment_builder: Optional[SentimentFeatureBuilder] = None
+        self.sentiment_store: Optional[DocumentStore] = None
         self._sentiment_cache: Dict[str, Dict] = {}
         self._sentiment_cache_ttl = timedelta(seconds=60)
         self._provider_warning_once = set()
+        self._store_warning_logged = False
 
         self._init_sentiment_pipeline()
 
@@ -826,6 +829,10 @@ class PolymarketPredictor:
         state = self.__dict__.copy()
         state["metrics_logger"] = None
         return state
+
+    @staticmethod
+    def _bucket_ts(as_of: datetime) -> int:
+        return int(as_of.replace(minute=0, second=0, microsecond=0).timestamp())
 
     # ------------------------------------------------------------------
     # Artifact helpers
@@ -856,6 +863,11 @@ class PolymarketPredictor:
             pass
         # Fallback to a fresh, untrained instance
         return cls()
+
+    def set_sentiment_store(self, store: Optional[DocumentStore]) -> None:
+        """Inject a sentiment aggregate store for runtime inference."""
+
+        self.sentiment_store = store
 
     def _init_sentiment_pipeline(self):
         """Initialize sentiment providers and scorer based on config."""
@@ -1326,7 +1338,7 @@ class PolymarketPredictor:
 
     def _get_sentiment_features(self, market: Dict, as_of: datetime) -> Dict[str, float]:
         market_id = market.get('id') or market.get('conditionId') or ""
-        if not self._sentiment_runtime_enabled():
+        if not self._sentiment_runtime_enabled() and not self.sentiment_store:
             return canonicalize_sentiment_features({})
 
         cached = self._sentiment_cache.get(market_id)
@@ -1334,20 +1346,27 @@ class PolymarketPredictor:
         if cache_hit:
             features = cached['features']
         else:
-            try:
-                features = canonicalize_sentiment_features(
-                    self.sentiment_builder.build_features(market=market, as_of=as_of)
-                )
-            except Exception as exc:  # pragma: no cover - runtime safety
-                provider_name = getattr(self.sentiment_builder.providers[0], 'name', 'sentiment') if getattr(self.sentiment_builder, 'providers', None) else 'sentiment'
-                if provider_name not in self._provider_warning_once:
-                    LOGGER.warning("Sentiment fetch failed (%s): %s", provider_name, exc)
-                    self._provider_warning_once.add(provider_name)
+            features = self._sentiment_from_store(market_id, as_of)
+            if features is None and self._sentiment_runtime_enabled():
+                try:
+                    features = canonicalize_sentiment_features(
+                        self.sentiment_builder.build_features(market=market, as_of=as_of)
+                    )
+                except Exception as exc:  # pragma: no cover - runtime safety
+                    provider_name = getattr(self.sentiment_builder, 'providers', None)
+                    provider_label = getattr(provider_name[0], 'name', 'sentiment') if provider_name else 'sentiment'
+                    if provider_label not in self._provider_warning_once:
+                        LOGGER.warning("Sentiment fetch failed (%s): %s", provider_label, exc)
+                        self._provider_warning_once.add(provider_label)
+                    features = canonicalize_sentiment_features({})
+            if features is None:
                 features = canonicalize_sentiment_features({})
 
             self._sentiment_cache[market_id] = {'ts': as_of, 'features': features}
 
-        provider_name = getattr(self.sentiment_builder.providers[0], 'name', 'sentiment') if getattr(self.sentiment_builder, 'providers', None) else 'sentiment'
+        provider_name = 'store' if self.sentiment_store else (
+            getattr(self.sentiment_builder.providers[0], 'name', 'sentiment') if getattr(self.sentiment_builder, 'providers', None) else 'sentiment'
+        )
         if self.metrics_logger:
             doc_counts = {w: features.get(f"doc_count_{w}", np.nan) for w in SENTIMENT_WINDOWS}
             percent_nan = float(np.mean([np.isnan(features.get(col, np.nan)) for col in SENTIMENT_COLUMNS]))
@@ -1363,6 +1382,21 @@ class PolymarketPredictor:
             )
 
         return features
+
+    def _sentiment_from_store(self, market_id: str, as_of: datetime) -> Optional[Dict[str, float]]:
+        if not self.sentiment_store:
+            return None
+
+        bucket_ts = self._bucket_ts(as_of)
+        row = self.sentiment_store.fetch_aggregate(market_id, bucket_ts)
+        if not row:
+            if not self._store_warning_logged:
+                LOGGER.info("No sentiment aggregate for market %s at %s; returning NaNs", market_id, bucket_ts)
+                self._store_warning_logged = True
+            return canonicalize_sentiment_features({})
+
+        features = {col: float(row[col]) if row[col] is not None else np.nan for col in row.keys() if col in SENTIMENT_COLUMNS}
+        return canonicalize_sentiment_features(features)
 
     def _align_feature_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self.feature_columns:

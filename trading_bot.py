@@ -15,6 +15,7 @@ import pandas as pd
 
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import PolymarketPredictor
+from sentiment.store import DocumentStore
 from bot.market_filters import MarketFilterConfig, should_trade_market
 from metrics import MetricsLogger, create_run_dir
 
@@ -211,6 +212,8 @@ class ProbabilityTradingBot:
         paper_trading: bool = True,
         risk_config: Optional[Dict] = None,
         bot_config: Optional[TradingBotConfig] = None,
+        sentiment_db_path: Optional[Path | str] = None,
+        sentiment_store: Optional[DocumentStore] = None,
         run_dir: Optional[str] = None,
         metrics_logger: Optional[MetricsLogger] = None,
     ):
@@ -220,6 +223,8 @@ class ProbabilityTradingBot:
         self.metrics_logger = metrics_logger or MetricsLogger(self.run_dir)
         self.predictor = load_latest_predictor(models_dir)
         self.predictor.metrics_logger = self.metrics_logger
+        self.sentiment_store = sentiment_store or self._maybe_init_store(sentiment_db_path)
+        self.predictor.set_sentiment_store(self.sentiment_store)
         self.threshold = threshold
         self.paper = paper_trading
         self.risk = RiskManager(**(risk_config or {}))
@@ -245,6 +250,18 @@ class ProbabilityTradingBot:
             capacity=self.bot_config.global_max_evals_per_sec,
         )
         self.skip_reasons: Dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+    def _maybe_init_store(self, sentiment_db_path: Optional[Path | str]) -> Optional[DocumentStore]:
+        path = Path(sentiment_db_path) if sentiment_db_path else Path(os.environ.get("SENTIMENT_DB", "data/sentiment.db"))
+        if not path.exists():
+            logger.info("Sentiment store %s not found; proceeding with NaN sentiment", path)
+            return None
+        try:
+            return DocumentStore(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to initialize sentiment store %s: %s", path, exc)
+            return None
 
     # ------------------------------------------------------------------
     def _get_market_state(self, market: Dict) -> Tuple[Optional[str], LiveMarketState]:

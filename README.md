@@ -58,6 +58,14 @@ python train_snapshot_model.py --snapshots_path data/features/snapshots.parquet
 
 Sentiment features are optional; toggle providers and keys in `config/sentiment_config.yaml`. When providers are unavailable, the snapshot builder and live inference fill the canonical sentiment columns with `NaN` so feature alignment is preserved.
 
+Run the background sentiment ingest service alongside the bot to continuously collect and store documents/aggregates locally:
+
+```bash
+python -m sentiment.ingest --db data/sentiment.db --config config/sentiment_config.yaml
+```
+
+The service runs independently of the trading loop, deduplicates documents, and upserts rolling aggregates (1h/6h/24h/7d) into the SQLite store.
+
 ## Backtest
 
 Replay snapshot-based trades with the probability bot rules in paper mode:
