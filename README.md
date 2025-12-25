@@ -49,6 +49,62 @@ python main.py
 python main.py 20
 ```
 
+## Training on resolved snapshots
+
+```bash
+python -m data.build_snapshots --out data/features/snapshots.parquet
+python train_snapshot_model.py --snapshots_path data/features/snapshots.parquet
+```
+
+Sentiment features are optional; toggle providers and keys in `config/sentiment_config.yaml`. When providers are unavailable, the snapshot builder and live inference fill the canonical sentiment columns with `NaN` so feature alignment is preserved.
+
+Run the background sentiment ingest service alongside the bot to continuously collect and store documents/aggregates locally:
+
+```bash
+python -m sentiment.ingest --db data/sentiment.db --config config/sentiment_config.yaml
+```
+
+The service runs independently of the trading loop, deduplicates documents, and upserts rolling aggregates (1h/6h/24h/7d) into the SQLite store.
+
+## Backtest
+
+Replay snapshot-based trades with the probability bot rules in paper mode:
+
+```bash
+python -m backtest.run \
+  --snapshots data/features/snapshots.parquet \
+  --model models/latest.joblib \
+  --out results/backtest/ \
+  --slippage_bps 5
+```
+
+The runner replays snapshot rows chronologically, applies the same threshold rules and risk manager as the live bot, and saves an equity curve, trade log, and summary metrics (JSON) under the output directory.
+
+## Monitoring & Metrics
+
+- Training, backtests, and the live bot emit JSONL metrics to a run directory (defaults under `results/run_<timestamp>/metrics.jsonl`).
+- Event types include `model_eval`, `decision`, `trade`, `sentiment`, `health` (throttles/backoff/staleness), and `filter_skip`.
+- Summaries and CSV exports can be generated via:
+
+```bash
+python -m metrics.summarize --run_dir results/run_20240101_120000
+```
+
+which writes `summary.json`, equity/drawdown CSVs, and counts for skips/sentiment/decisions.
+
+## Market quality filters
+
+Trading, backtesting, and NegRisk arbitration all call a shared market-quality filter (`bot/market_filters.py`) configured via `config/trading_bot_config.yaml`. Filters can exclude markets with:
+
+- Volume below `min_24h_volume`
+- Spreads above `max_spread_abs` or `max_spread_pct`
+- Top-of-book depth below `min_top_of_book_depth`
+- Fewer than `min_trades_last_24h` recent trades (when available)
+- Ambiguous rules/description text (length + keyword heuristic)
+- Time-to-resolution below `skip_if_time_to_resolve_lt`
+
+Lowering thresholds increases coverage but risks stale/illiquid fills; tightening them improves execution quality at the cost of fewer opportunities. Skip reasons are logged to aid tuning.
+
 ## Output
 
 The system provides:

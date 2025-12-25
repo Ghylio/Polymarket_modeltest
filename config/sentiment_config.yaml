@@ -1,0 +1,12 @@
+providers:
+  gdelt:
+    enabled: true
+  newsapi:
+    enabled: false
+    api_key: ""
+  twitter:
+    enabled: false
+    bearer_token: ""
+sentiment:
+  enabled: true
+  model: distilbert-base-uncased-finetuned-sst-2-english

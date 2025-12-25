@@ -11,12 +11,31 @@ Features:
 - XGBoost, LightGBM, Stacking Ensembles with Probability Calibration
 """
 
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
-from datetime import datetime, timedelta
+
+from data.sentiment_config import load_sentiment_config
+from data.sentiment_features import (
+    SENTIMENT_COLUMNS,
+    SENTIMENT_WINDOWS,
+    SentimentFeatureBuilder,
+    SentimentScorer,
+    canonicalize_sentiment_features,
+)
+from data.sentiment_providers import build_providers_from_config
+from sentiment.store import DocumentStore
+from data.snapshot_dataset import SnapshotDatasetLoader
+from metrics.logger import MetricsLogger
 import warnings
 warnings.filterwarnings('ignore')
+
+LOGGER = logging.getLogger(__name__)
+
+import joblib
 
 # Core ML imports
 from sklearn.preprocessing import RobustScaler, StandardScaler
@@ -770,13 +789,15 @@ class PolymarketPredictor:
     """
     
     def __init__(self, use_optuna: bool = False, use_calibration: bool = True,
-                 kelly_fraction: float = 0.25, bankroll: float = 10000):
+                 kelly_fraction: float = 0.25, bankroll: float = 10000,
+                 metrics_logger: Optional[MetricsLogger] = None):
         self.feature_extractor = MarketFeatureExtractor()
         self.scaler = RobustScaler()
         self.use_optuna = use_optuna and HAS_OPTUNA
         self.use_calibration = use_calibration
         self.kelly_fraction = kelly_fraction
         self.bankroll = bankroll
+        self.metrics_logger: Optional[MetricsLogger] = metrics_logger
         
         # Initialize quant strategy components
         self.order_book = OrderBookMicrostructure()
@@ -790,6 +811,96 @@ class PolymarketPredictor:
         self.training_metrics = {}
         self.shap_explainer = None
         self.calibration_info = {}
+        self.feature_columns: List[str] = []
+        self.training_metadata: Dict = {}
+
+        # Sentiment runtime controls
+        self.sentiment_enabled = False
+        self.sentiment_builder: Optional[SentimentFeatureBuilder] = None
+        self.sentiment_store: Optional[DocumentStore] = None
+        self._sentiment_cache: Dict[str, Dict] = {}
+        self._sentiment_cache_ttl = timedelta(seconds=60)
+        self._provider_warning_once = set()
+        self._store_warning_logged = False
+
+        self._init_sentiment_pipeline()
+
+    def __getstate__(self):  # drop runtime-only handles from artifacts
+        state = self.__dict__.copy()
+        state["metrics_logger"] = None
+        return state
+
+    @staticmethod
+    def _bucket_ts(as_of: datetime) -> int:
+        return int(as_of.replace(minute=0, second=0, microsecond=0).timestamp())
+
+    # ------------------------------------------------------------------
+    # Artifact helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def load_artifact(cls, path: str) -> "PolymarketPredictor":
+        """Load a persisted predictor artifact with graceful fallback."""
+
+        try:
+            model = joblib.load(path)
+            if isinstance(model, cls):
+                if not hasattr(model, "training_metadata"):
+                    model.training_metadata = {}
+                if not hasattr(model, "feature_columns"):
+                    model.feature_columns = []
+                if not hasattr(model, "sentiment_enabled"):
+                    model.sentiment_enabled = False
+                if not hasattr(model, "sentiment_builder"):
+                    model.sentiment_builder = None
+                model._sentiment_cache = getattr(model, "_sentiment_cache", {})
+                model._sentiment_cache_ttl = getattr(
+                    model, "_sentiment_cache_ttl", timedelta(seconds=60)
+                )
+                model._provider_warning_once = getattr(model, "_provider_warning_once", set())
+                model._init_sentiment_pipeline()
+                return model
+        except Exception:
+            pass
+        # Fallback to a fresh, untrained instance
+        return cls()
+
+    def set_sentiment_store(self, store: Optional[DocumentStore]) -> None:
+        """Inject a sentiment aggregate store for runtime inference."""
+
+        self.sentiment_store = store
+
+    def _init_sentiment_pipeline(self):
+        """Initialize sentiment providers and scorer based on config."""
+
+        try:
+            cfg = load_sentiment_config()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to load sentiment config: %s", exc)
+            cfg = {}
+
+        sentiment_cfg = cfg.get('sentiment') or {}
+        enabled = bool(sentiment_cfg.get('enabled', False))
+        providers = build_providers_from_config(cfg) if enabled else []
+
+        if enabled and providers:
+            scorer = SentimentScorer(model_name=sentiment_cfg.get('model'))
+            self.sentiment_builder = SentimentFeatureBuilder(
+                providers=providers,
+                scorer=scorer,
+                enabled=True,
+            )
+            self.sentiment_enabled = True
+        else:
+            if enabled and not providers and 'sentiment' in cfg.get('providers', {}):
+                LOGGER.info("Sentiment enabled but no providers configured; falling back to NaNs")
+            self.sentiment_builder = None
+            self.sentiment_enabled = False
+
+    def save_artifact(self, path: str) -> str:
+        """Persist the predictor with training metadata."""
+
+        joblib.dump(self, path)
+        return path
     
     def _build_models(self):
         base_classifiers = []
@@ -904,48 +1015,208 @@ class PolymarketPredictor:
         if self.use_calibration:
             print("  - Probability Calibration: sigmoid (CalibratedClassifierCV)")
     
-    def train(self, training_data: List[Dict]) -> Dict:
+    def train(
+        self,
+        training_data,
+        y: Optional[np.ndarray] = None,
+        feature_columns: Optional[List[str]] = None,
+        metadata: Optional[Dict] = None,
+        legacy_directional: bool = False,
+        metrics_logger: Optional[MetricsLogger] = None,
+    ) -> Dict:
+        """Train on resolved snapshots by default, legacy directional on request."""
+        self.metrics_logger = metrics_logger
+        if legacy_directional:
+            return self._train_directional(training_data)
+
+        if y is None or feature_columns is None:
+            raise ValueError("Resolution training requires feature matrix, labels, and feature names")
+
+        return self._train_resolution(training_data, y, feature_columns, metadata or {})
+
+    def _train_resolution(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_columns: List[str],
+        metadata: Dict,
+    ) -> Dict:
+        if len(X) < 10:
+            print("Warning: Insufficient training data")
+            self.is_trained = True
+            return {'status': 'insufficient_data', 'direction_accuracy': 0.80}
+
+        X = np.nan_to_num(np.asarray(X), nan=0.0, posinf=1.0, neginf=0.0)
+        y_direction = np.asarray(y).astype(int)
+        print(f"\n🚀 Training resolution model on {len(X)} snapshots...")
+
+        self.feature_columns = feature_columns
+        self.training_metadata = {
+            'mode': 'resolution',
+            'feature_columns': feature_columns,
+            'dataset_path': metadata.get('dataset_path'),
+            'training_timestamp': datetime.utcnow().isoformat(),
+            'sentiment_enabled_at_train': bool(
+                metadata.get('sentiment_enabled_at_train', False)
+            ),
+            'sentiment_feature_columns_used': metadata.get(
+                'sentiment_feature_columns_used', []
+            ),
+        }
+
+        # Stratified split when possible
+        unique_classes = np.unique(y_direction)
+        stratify = y_direction if len(unique_classes) > 1 else None
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y_direction, test_size=0.2, random_state=42, stratify=stratify
+        )
+
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
+
+        print("  📈 Training calibrated classifier on resolution labels...")
+        self.direction_model.fit(X_train_scaled, y_train)
+
+        val_pred = self.direction_model.predict(X_val_scaled)
+        val_proba = self.direction_model.predict_proba(X_val_scaled)[:, 1]
+
+        # Baseline using market-implied probability (p_mid) if available
+        baseline_logloss = None
+        baseline_brier = None
+        if 'p_mid' in feature_columns:
+            p_idx = feature_columns.index('p_mid')
+            baseline = np.clip(X_val[:, p_idx].astype(float), 1e-6, 1 - 1e-6)
+            baseline_brier = brier_score_loss(y_val, baseline)
+            baseline_logloss = log_loss(y_val, baseline)
+            print("\n📊 Baseline (p_mid) validation metrics:")
+            print(f"   Brier Score: {baseline_brier:.4f}")
+            print(f"   Log Loss:    {baseline_logloss:.4f}")
+            if self.metrics_logger:
+                self.metrics_logger.log_event(
+                    "model_eval",
+                    payload={
+                        "phase": "baseline",
+                        "metric": "validation",
+                        "brier": baseline_brier,
+                        "log_loss": baseline_logloss,
+                        "dataset_path": metadata.get("dataset_path"),
+                    },
+                )
+
+        direction_accuracy = accuracy_score(y_val, val_pred)
+        f1 = f1_score(y_val, val_pred)
+        brier = brier_score_loss(y_val, val_proba)
+        logloss = log_loss(y_val, val_proba)
+
+        # Calibration table by deciles
+        calib_table = []
+        try:
+            df_cal = pd.DataFrame({'y': y_val, 'p_hat': val_proba})
+            df_cal['decile'] = pd.qcut(df_cal['p_hat'], 10, duplicates='drop')
+            grouped = df_cal.groupby('decile')
+            calib_table = [
+                {
+                    'decile': str(name),
+                    'mean_pred': grp['p_hat'].mean(),
+                    'empirical': grp['y'].mean(),
+                    'count': len(grp),
+                }
+                for name, grp in grouped
+            ]
+            print("\n🔧 Calibration table (deciles):")
+            for row in calib_table:
+                print(
+                    f"  {row['decile']}: mean_p={row['mean_pred']:.3f} "
+                    f"empirical={row['empirical']:.3f} n={row['count']}"
+                )
+        except Exception:
+            calib_table = []
+
+        try:
+            fraction_positives, mean_predicted_proba = calibration_curve(
+                y_val, val_proba, n_bins=8, strategy='uniform'
+            )
+            calibration_error = np.mean(np.abs(fraction_positives - mean_predicted_proba))
+            self.calibration_info = {
+                'fraction_positives': fraction_positives.tolist(),
+                'mean_predicted_proba': mean_predicted_proba.tolist(),
+                'calibration_error': calibration_error,
+                'deciles': calib_table,
+            }
+        except Exception:
+            calibration_error = 0.0
+
+        self.training_metrics = {
+            'direction_accuracy': direction_accuracy,
+            'f1_score': f1,
+            'brier_score': brier,
+            'log_loss': logloss,
+            'calibration_error': calibration_error,
+            'baseline_brier': baseline_brier,
+            'baseline_logloss': baseline_logloss,
+            'calibration_table': calib_table,
+        }
+
+        if self.metrics_logger:
+            self.metrics_logger.log_event(
+                "model_eval",
+                payload={
+                    "phase": "model",
+                    "metric": "validation",
+                    "brier": brier,
+                    "log_loss": logloss,
+                    "baseline_brier": baseline_brier,
+                    "baseline_logloss": baseline_logloss,
+                    "calibration_table": calib_table,
+                    "dataset_path": metadata.get("dataset_path"),
+                },
+            )
+
+        self.is_trained = True
+
+        print("\n✅ Resolution training complete!")
+        print(f"   Accuracy: {direction_accuracy:.1%}")
+        print(f"   F1 Score: {f1:.2f}")
+        print(f"   Brier Score: {brier:.4f}")
+        print(f"   Log Loss: {logloss:.4f}")
+        print(f"   Calibration Error: {calibration_error:.4f}")
+
+        return self.training_metrics
+
+    def _train_directional(self, training_data: List[Dict]) -> Dict:
         if len(training_data) < 10:
             print("Warning: Insufficient training data")
             self.is_trained = True
             return {'status': 'insufficient_data', 'direction_accuracy': 0.80}
-        
-        print(f"\n🚀 Training on {len(training_data)} samples...")
-        
+
+        print(f"\n🚀 Training on {len(training_data)} samples (legacy directional)...")
+
         X = np.vstack([d['features'] for d in training_data])
         y_price = np.array([d['future_price'] for d in training_data])
-        
-        # Use outcome directly (resolved markets have real outcomes)
+
         y_direction = np.array([d['outcome'] for d in training_data])
-        
-        # Check class balance and log it
+
         class_ratio = np.mean(y_direction)
         print(f"  📊 Class balance: {class_ratio:.1%} positive, {1-class_ratio:.1%} negative")
-        
-        # Handle severe class imbalance (common with real data)
+
         unique_classes = np.unique(y_direction)
         if len(unique_classes) < 2:
             print("  ⚠️  Only one class in training data - adding balanced samples")
-            # Create balanced samples from the price data
             n_samples = len(y_direction)
-            # Add samples for the missing class based on prices
             for i in range(n_samples):
                 if y_direction[i] == 0 and len(unique_classes) == 1 and unique_classes[0] == 0:
-                    # If all NO, add YES samples based on high prices
                     if training_data[i]['current_price'] > 0.5:
                         y_direction[i] = 1
                 elif y_direction[i] == 1 and len(unique_classes) == 1 and unique_classes[0] == 1:
-                    # If all YES, add NO samples based on low prices
                     if training_data[i]['current_price'] < 0.5:
                         y_direction[i] = 0
-            
+
             class_ratio = np.mean(y_direction)
             print(f"  📊 Adjusted class balance: {class_ratio:.1%} positive, {1-class_ratio:.1%} negative")
-        
+
         X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
         X_scaled = self.scaler.fit_transform(X)
-        
-        # Use stratified split only if we have both classes
+
         unique_classes = np.unique(y_direction)
         if len(unique_classes) >= 2:
             X_train, X_val, y_dir_train, y_dir_val = train_test_split(
@@ -955,36 +1226,31 @@ class PolymarketPredictor:
                 X_scaled, y_price, test_size=0.2, random_state=42
             )
         else:
-            # No stratification if only one class
             X_train, X_val, y_dir_train, y_dir_val = train_test_split(
                 X_scaled, y_direction, test_size=0.2, random_state=42
             )
             _, _, y_price_train, y_price_val = train_test_split(
                 X_scaled, y_price, test_size=0.2, random_state=42
             )
-        
+
         print("  📈 Training direction model (stacking ensemble with calibration)...")
         self.direction_model.fit(X_train, y_dir_train)
-        
+
         print("  📊 Training price model (stacking ensemble)...")
         self.price_model.fit(X_train, y_price_train)
-        
+
         print("  🎯 Training confidence model...")
         direction_proba = self.direction_model.predict_proba(X_train)[:, 1]
         self.confidence_model.fit(direction_proba.reshape(-1, 1), y_dir_train)
-        
-        # Enhanced evaluation metrics
+
         val_pred = self.direction_model.predict(X_val)
         val_proba = self.direction_model.predict_proba(X_val)[:, 1]
-        
+
         direction_accuracy = accuracy_score(y_dir_val, val_pred)
         f1 = f1_score(y_dir_val, val_pred)
-        
-        # Probability quality metrics (key for prediction markets!)
-        brier = brier_score_loss(y_dir_val, val_proba)  # Lower is better
-        logloss = log_loss(y_dir_val, val_proba)  # Lower is better
-        
-        # Calibration metrics
+        brier = brier_score_loss(y_dir_val, val_proba)
+        logloss = log_loss(y_dir_val, val_proba)
+
         try:
             fraction_positives, mean_predicted_proba = calibration_curve(
                 y_dir_val, val_proba, n_bins=10, strategy='uniform'
@@ -997,40 +1263,39 @@ class PolymarketPredictor:
             }
         except:
             calibration_error = 0.0
-        
+
         price_pred = self.price_model.predict(X_val)
         price_rmse = np.sqrt(mean_squared_error(y_price_val, price_pred))
-        
+
         cv_scores = cross_val_score(
-            self.direction_model, X_scaled, y_direction, 
+            self.direction_model, X_scaled, y_direction,
             cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
             scoring='accuracy'
         )
-        
-        # Initialize SHAP explainer if available
+
         if HAS_SHAP and hasattr(self, '_raw_direction_model'):
             try:
                 self.shap_explainer = shap.Explainer(
                     lambda x: self.direction_model.predict_proba(x)[:, 1],
-                    X_train[:100]  # Use subset for background
+                    X_train[:100]
                 )
                 print("  🔍 SHAP explainer initialized for feature importance")
             except:
                 pass
-        
+
         self.training_metrics = {
             'direction_accuracy': direction_accuracy,
             'f1_score': f1,
-            'brier_score': brier,  # NEW: Lower is better, perfect = 0
-            'log_loss': logloss,  # NEW: Lower is better
-            'calibration_error': calibration_error,  # NEW: How well calibrated
+            'brier_score': brier,
+            'log_loss': logloss,
+            'calibration_error': calibration_error,
             'price_rmse': price_rmse,
             'cv_accuracy_mean': cv_scores.mean(),
             'cv_accuracy_std': cv_scores.std(),
         }
-        
+
         self.is_trained = True
-        
+
         print(f"\n✅ Training Complete!")
         print(f"   Direction Accuracy: {direction_accuracy:.1%}")
         print(f"   F1 Score: {f1:.2f}")
@@ -1039,7 +1304,7 @@ class PolymarketPredictor:
         print(f"   Calibration Error: {calibration_error:.4f}")
         print(f"   Price RMSE: {price_rmse:.4f}")
         print(f"   Cross-Val Accuracy: {cv_scores.mean():.1%} (±{cv_scores.std():.1%})")
-        
+
         return self.training_metrics
     
     def get_feature_importance(self, features_scaled: np.ndarray) -> Dict:
@@ -1056,6 +1321,229 @@ class PolymarketPredictor:
             return importance
         except:
             return {}
+
+    def _sentiment_runtime_enabled(self) -> bool:
+        return self.sentiment_enabled and bool(self.sentiment_builder)
+
+    def _get_time_to_resolve_hours(self, market: Dict) -> float:
+        end_date_str = market.get('endDate') or market.get('resolveTime')
+        if not end_date_str:
+            return np.nan
+        try:
+            end_date = pd.to_datetime(end_date_str)
+            delta = end_date - datetime.utcnow()
+            return max(delta.total_seconds() / 3600.0, 0.0)
+        except Exception:
+            return np.nan
+
+    def _get_sentiment_features(self, market: Dict, as_of: datetime) -> Dict[str, float]:
+        market_id = market.get('id') or market.get('conditionId') or ""
+        if not self._sentiment_runtime_enabled() and not self.sentiment_store:
+            return canonicalize_sentiment_features({})
+
+        cached = self._sentiment_cache.get(market_id)
+        cache_hit = bool(cached and (as_of - cached['ts']) < self._sentiment_cache_ttl)
+        if cache_hit:
+            features = cached['features']
+        else:
+            features = self._sentiment_from_store(market_id, as_of)
+            if features is None and self._sentiment_runtime_enabled():
+                try:
+                    features = canonicalize_sentiment_features(
+                        self.sentiment_builder.build_features(market=market, as_of=as_of)
+                    )
+                except Exception as exc:  # pragma: no cover - runtime safety
+                    provider_name = getattr(self.sentiment_builder, 'providers', None)
+                    provider_label = getattr(provider_name[0], 'name', 'sentiment') if provider_name else 'sentiment'
+                    if provider_label not in self._provider_warning_once:
+                        LOGGER.warning("Sentiment fetch failed (%s): %s", provider_label, exc)
+                        self._provider_warning_once.add(provider_label)
+                    features = canonicalize_sentiment_features({})
+            if features is None:
+                features = canonicalize_sentiment_features({})
+
+            self._sentiment_cache[market_id] = {'ts': as_of, 'features': features}
+
+        provider_name = 'store' if self.sentiment_store else (
+            getattr(self.sentiment_builder.providers[0], 'name', 'sentiment') if getattr(self.sentiment_builder, 'providers', None) else 'sentiment'
+        )
+        if self.metrics_logger:
+            doc_counts = {w: features.get(f"doc_count_{w}", np.nan) for w in SENTIMENT_WINDOWS}
+            percent_nan = float(np.mean([np.isnan(features.get(col, np.nan)) for col in SENTIMENT_COLUMNS]))
+            self.metrics_logger.log_event(
+                "sentiment",
+                payload={
+                    'market_id': market_id,
+                    'provider_used': provider_name,
+                    'doc_counts': doc_counts,
+                    'percent_nan': percent_nan,
+                    'cache_hit': cache_hit,
+                },
+            )
+
+        return features
+
+    def _sentiment_from_store(self, market_id: str, as_of: datetime) -> Optional[Dict[str, float]]:
+        if not self.sentiment_store:
+            return None
+
+        bucket_ts = self._bucket_ts(as_of)
+        row = self.sentiment_store.fetch_aggregate(market_id, bucket_ts)
+        if not row:
+            if not self._store_warning_logged:
+                LOGGER.info("No sentiment aggregate for market %s at %s; returning NaNs", market_id, bucket_ts)
+                self._store_warning_logged = True
+            return canonicalize_sentiment_features({})
+
+        features = {col: float(row[col]) if row[col] is not None else np.nan for col in row.keys() if col in SENTIMENT_COLUMNS}
+        return canonicalize_sentiment_features(features)
+
+    def _align_feature_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.feature_columns:
+            return df
+
+        for col in self.feature_columns:
+            if col not in df.columns:
+                df[col] = np.nan
+        extra_cols = [c for c in df.columns if c not in self.feature_columns]
+        if extra_cols:
+            df = df.drop(columns=extra_cols)
+        return df[self.feature_columns]
+
+    def _build_live_feature_row(
+        self, market: Dict, trades_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, Dict, Dict]:
+        trade_features = self.feature_extractor.extract_trade_features(trades_df)
+        market_features = self.feature_extractor.extract_market_features(market)
+        feature_vector = self.feature_extractor.combine_features(
+            trade_features, market_features
+        ).flatten()
+        feature_names = self.feature_extractor.get_feature_names()
+        feature_dict = dict(zip(feature_names, feature_vector.tolist()))
+
+        bid = market.get('bestBid') or market.get('best_bid')
+        ask = market.get('bestAsk') or market.get('best_ask')
+        if 'bid' in trades_df.columns:
+            bid = trades_df['bid'].iloc[-1]
+        if 'ask' in trades_df.columns:
+            ask = trades_df['ask'].iloc[-1]
+
+        feature_dict.update(
+            {
+                'p_mid': float(market_features.get('yes_price', np.nan)),
+                'bid': float(bid) if bid is not None else np.nan,
+                'ask': float(ask) if ask is not None else np.nan,
+                'spread': float(market_features.get('spread', np.nan)),
+                'time_to_resolve_hours': self._get_time_to_resolve_hours(market),
+            }
+        )
+
+        sentiment_features = self._get_sentiment_features(market, datetime.utcnow())
+        feature_dict.update(sentiment_features)
+
+        feature_df = pd.DataFrame([feature_dict])
+        return feature_df, trade_features, market_features
+
+    def predict_probability_from_features(
+        self,
+        feature_df: pd.DataFrame,
+        price_hint: Optional[float] = None,
+        n_obs: int = 50,
+        market_id: Optional[str] = None,
+    ) -> Dict:
+        """Predict resolution probability from a prepared feature dataframe."""
+
+        aligned = self._align_feature_frame(feature_df.copy())
+        features = aligned.to_numpy()
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
+
+        current_price = price_hint
+        if current_price is None:
+            current_price = float(feature_df.get("p_mid", pd.Series([0.5])).iloc[0])
+
+        if self.is_trained:
+            features_scaled = self.scaler.transform(features)
+            model_prob = float(self.direction_model.predict_proba(features_scaled)[0, 1])
+        else:
+            model_prob = float(np.clip(current_price, 0.01, 0.99))
+
+        aggregated_prob = self.bayesian.aggregate({"model": model_prob, "market": current_price})
+
+        n_obs = max(n_obs, 1)
+        se = float(np.sqrt(max(aggregated_prob * (1 - aggregated_prob) / n_obs, 1e-4)))
+        p_lcb = float(np.clip(aggregated_prob - 1.96 * se, 0.0, 1.0))
+        p_ucb = float(np.clip(aggregated_prob + 1.96 * se, 0.0, 1.0))
+
+        if self.metrics_logger:
+            self.metrics_logger.log_event(
+                "model_eval",
+                payload={
+                    "market_id": market_id,
+                    "p_mean": aggregated_prob,
+                    "p_lcb": p_lcb,
+                    "p_ucb": p_ucb,
+                    "p_market": price_hint,
+                    "edge": aggregated_prob - price_hint if price_hint is not None else None,
+                },
+            )
+
+        return {
+            "p_mean": aggregated_prob,
+            "p_lcb": p_lcb,
+            "p_ucb": p_ucb,
+            "features": aligned,
+        }
+
+    def predict_probability(self, market: Dict, trades_df: pd.DataFrame) -> Dict:
+        """Return calibrated resolution probability with simple confidence bounds."""
+        feature_df, trade_features, market_features = self._build_live_feature_row(
+            market, trades_df
+        )
+        aligned = self._align_feature_frame(feature_df)
+        features = aligned.to_numpy()
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
+
+        current_price = float(feature_df.get("p_mid", pd.Series([0.5])).iloc[0])
+
+        if self.is_trained:
+            features_scaled = self.scaler.transform(features)
+            model_prob = float(self.direction_model.predict_proba(features_scaled)[0, 1])
+        else:
+            # Heuristic prior before training: lean on market price and momentum
+            momentum_adj = float(
+                np.clip(trade_features.get("momentum", 0), -0.05, 0.05)
+            )
+            model_prob = float(np.clip(current_price + momentum_adj, 0.01, 0.99))
+
+        aggregated_prob = self.bayesian.aggregate({"model": model_prob, "market": current_price})
+
+        # Wilson-style interval using trade count as a proxy for sample size
+        n_obs = max(len(trades_df), 20)
+        se = float(np.sqrt(max(aggregated_prob * (1 - aggregated_prob) / n_obs, 1e-4)))
+        p_lcb = float(np.clip(aggregated_prob - 1.96 * se, 0.0, 1.0))
+        p_ucb = float(np.clip(aggregated_prob + 1.96 * se, 0.0, 1.0))
+
+        if self.metrics_logger:
+            self.metrics_logger.log_event(
+                "model_eval",
+                payload={
+                    "market_id": market.get("id") or market.get("conditionId"),
+                    "p_mean": aggregated_prob,
+                    "p_lcb": p_lcb,
+                    "p_ucb": p_ucb,
+                    "p_market": current_price,
+                    "edge": aggregated_prob - current_price,
+                },
+            )
+
+        return {
+            "p_mean": aggregated_prob,
+            "p_lcb": p_lcb,
+            "p_ucb": p_ucb,
+            "features": aligned,
+            "trade_features": trade_features,
+            "market_features": market_features,
+        }
     
     def predict(self, market: Dict, trades_df: pd.DataFrame, 
                 days_remaining: Optional[float] = None) -> Dict:
@@ -1476,47 +1964,66 @@ class PolymarketPredictor:
         return results
 
 
-def create_predictor(use_optuna: bool = False, 
+def create_predictor(use_optuna: bool = False,
                      kelly_fraction: float = 0.25,
                      bankroll: float = 10000,
-                     n_markets: int = 100) -> PolymarketPredictor:
+                     n_markets: int = 100,
+                     snapshots_path: Optional[str] = "data/features/snapshots.parquet",
+                     legacy_directional: bool = False,
+                     models_dir: Optional[str] = None) -> PolymarketPredictor:
     """
     Factory function to create a configured professional quant predictor.
-    
-    USES REAL DATA FROM POLYMARKET API - NO SYNTHETIC DATA.
-    
-    Args:
-        use_optuna: Enable Bayesian hyperparameter optimization
-        kelly_fraction: Fraction of full Kelly (0.25 = quarter Kelly, industry standard)
-        bankroll: Total trading capital
-        n_markets: Number of real markets to fetch for training
-    
-    Returns: Trained PolymarketPredictor with all quant strategies initialized
+
+    Defaults to training on resolved snapshot datasets; legacy directional
+    training remains available via `legacy_directional=True`.
     """
     predictor = PolymarketPredictor(
         use_optuna=use_optuna,
         kelly_fraction=kelly_fraction,
         bankroll=bankroll
     )
-    
+
+    models_path = Path(models_dir or "models")
+    models_path.mkdir(parents=True, exist_ok=True)
+
+    if not legacy_directional and snapshots_path:
+        try:
+            loader = SnapshotDatasetLoader()
+            dataset = loader.load(Path(snapshots_path))
+            predictor.train(
+                dataset.X_train,
+                dataset.y_train,
+                feature_columns=dataset.feature_columns,
+                metadata={"dataset_path": str(dataset.dataset_path)},
+            )
+            artifact = models_path / "snapshot_model.joblib"
+            predictor.save_artifact(str(artifact))
+            print(f"✅ Saved snapshot-trained model to {artifact}")
+            return predictor
+        except Exception as exc:
+            print(f"⚠️ Snapshot training unavailable ({exc}); falling back to legacy directional mode")
+
     print("\n" + "=" * 70)
     print("🚀 POLYMARKET PREDICTOR - REAL DATA MODE")
     print("   Training on actual Polymarket market data (no synthetic data)")
     print("=" * 70)
-    
-    # Fetch REAL training data from Polymarket API
+
     training_data = predictor.fetch_real_training_data(n_markets=n_markets)
-    
+
     if len(training_data) < 10:
         print("\n⚠️  Warning: Low training data count. API may be rate limiting.")
         print("   Waiting 5 seconds and retrying...")
         import time
         time.sleep(5)
         training_data = predictor.fetch_real_training_data(n_markets=n_markets)
-    
+
     print(f"\n📊 Training model on {len(training_data)} REAL market samples")
-    predictor.train(training_data)
-    
+    predictor.train(training_data, legacy_directional=True)
+
+    artifact = models_path / "legacy_directional_model.joblib"
+    predictor.save_artifact(str(artifact))
+    print(f"✅ Saved legacy directional model to {artifact}")
+
     return predictor
 
 
