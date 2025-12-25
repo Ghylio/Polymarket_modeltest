@@ -34,9 +34,13 @@ secrets.json
 # Data files (if any)
 *.csv
 *.json
-data/
 *.db
 *.sqlite
+# Allow tracked Python modules in data/, but ignore raw datasets
+data/*.csv
+data/*.json
+data/*.db
+data/*.sqlite
 
 # Model files
 *.pkl
