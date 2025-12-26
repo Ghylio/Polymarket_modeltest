@@ -20,6 +20,52 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _extract_event_id(row: pd.Series) -> Optional[str]:
+    for key in ("event_id", "eventId", "group_id", "groupId"):
+        if key in row and pd.notna(row[key]):
+            return str(row[key])
+    for key in ("market_id", "id"):
+        if key in row and pd.notna(row[key]):
+            return str(row[key])
+    return None
+
+
+def _extract_token_id(row: pd.Series) -> Optional[str]:
+    for key in ("token_id", "tokenId", "clobTokenId", "clob_token_id"):
+        if key in row and pd.notna(row[key]):
+            return str(row[key])
+    return None
+
+
+def _price_from_series(row: pd.Series) -> Tuple[float, float, float]:
+    bid = float(row.get("bid", np.nan))
+    ask = float(row.get("ask", np.nan))
+    p_mid = float(row.get("p_mid", np.nan))
+    spread = float(row.get("spread", np.nan)) if not pd.isna(row.get("spread")) else np.nan
+
+    if np.isnan(bid) and not np.isnan(p_mid) and not np.isnan(spread):
+        bid = max(p_mid - spread / 2, 0.0)
+    if np.isnan(ask) and not np.isnan(p_mid) and not np.isnan(spread):
+        ask = min(p_mid + spread / 2, 1.0)
+    if np.isnan(p_mid) and not np.isnan(bid) and not np.isnan(ask):
+        p_mid = (bid + ask) / 2
+    if np.isnan(spread) and not np.isnan(bid) and not np.isnan(ask):
+        spread = abs(ask - bid)
+
+    return bid, ask, p_mid
+
+
+def _apply_slippage_static(price: float, side: str, config: BacktestConfig) -> float:
+    if np.isnan(price):
+        return price
+    slippage = config.slippage_bps / 10000.0
+    if config.slippage_ticks:
+        slippage = max(slippage, config.slippage_ticks)
+    if side in {"BUY_YES", "SELL_NO"}:
+        return min(1.0, price * (1 + slippage))
+    return max(0.0, price * (1 - slippage))
+
+
 @dataclass
 class BacktestConfig:
     threshold: float = 0.05
@@ -30,6 +76,15 @@ class BacktestConfig:
     throttle_config: Dict = field(default_factory=dict)
     risk_config: Dict = field(default_factory=dict)
     filter_config: Dict = field(default_factory=dict)
+    # Structural arbitrage replay settings
+    arb_enabled: bool = False
+    arb_edge_min: float = 0.01
+    arb_slippage_buffer: float = 0.01
+    arb_execution_buffer: float = 0.01
+    arb_size: float = 1.0
+    cooldown_after_partial_fill_sec: float = 300.0
+    arb_max_outcomes: int = 12
+    arb_min_depth_per_leg: float = 0.0
 
 
 @dataclass
@@ -48,6 +103,99 @@ class TradeRecord:
     ask: float
     edge: float
     realized_pnl: float
+
+
+@dataclass
+class ArbReplayState:
+    attempts: int = 0
+    wins: int = 0
+    losses: int = 0
+    partial_fills: int = 0
+    pnl: float = 0.0
+    attempt_loss: float = 0.0
+
+
+def replay_structural_arb(snapshots: pd.DataFrame, config: BacktestConfig) -> ArbReplayState:
+    """Simulate structural arbitrage trades from snapshot rows."""
+
+    state = ArbReplayState()
+    if not config.arb_enabled:
+        return state
+
+    if "snapshot_ts" not in snapshots.columns:
+        return state
+
+    df = snapshots.copy()
+    df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"], errors="coerce")
+    df = df.dropna(subset=["snapshot_ts"])
+    if df.empty:
+        return state
+
+    df["__event_id"] = df.apply(_extract_event_id, axis=1)
+    df["__token_id"] = df.apply(_extract_token_id, axis=1)
+    df = df.dropna(subset=["__event_id", "__token_id"])
+    if df.empty:
+        return state
+
+    cooldowns: Dict[str, float] = {}
+
+    # Ensure chronological processing
+    df = df.sort_values("snapshot_ts")
+
+    for (event_id, snapshot_ts), group in df.groupby(["__event_id", "snapshot_ts"], sort=False):
+        ts_val = pd.to_datetime(snapshot_ts).timestamp()
+        cooldown_until = cooldowns.get(event_id, 0)
+        if cooldown_until and cooldown_until > ts_val:
+            continue
+
+        legs = []
+        for _, row in group.iterrows():
+            bid, ask, _ = _price_from_series(row)
+            depth = float(row.get("depth", np.nan)) if "depth" in row else np.nan
+            if np.isnan(ask):
+                continue
+            if config.arb_min_depth_per_leg and (np.isnan(depth) or depth < config.arb_min_depth_per_leg):
+                legs = []
+                break
+            legs.append((row["__token_id"], ask, depth))
+
+        if len(legs) < 2 or len(legs) > config.arb_max_outcomes:
+            continue
+
+        total_cost = sum(price for _, price, _ in legs)
+        edge = 1.0 - total_cost
+        effective_edge = edge - (config.arb_slippage_buffer + config.arb_execution_buffer)
+        if effective_edge <= config.arb_edge_min:
+            continue
+
+        min_depth = min([d for _, _, d in legs if not np.isnan(d)], default=np.nan)
+        if np.isnan(min_depth) or min_depth <= 0:
+            continue
+
+        desired_size = config.arb_size
+        filled_size = min(desired_size, min_depth)
+        if filled_size <= 0:
+            continue
+
+        exec_cost = sum(_apply_slippage_static(price, "BUY_YES", config) for _, price, _ in legs)
+        exec_cost *= filled_size
+
+        pnl = filled_size - exec_cost
+        state.attempts += 1
+        state.pnl += pnl
+
+        if filled_size < desired_size:
+            state.partial_fills += 1
+            state.attempt_loss += exec_cost
+            cooldowns[event_id] = ts_val + config.cooldown_after_partial_fill_sec
+            continue
+
+        if pnl >= 0:
+            state.wins += 1
+        else:
+            state.losses += 1
+
+    return state
 
 
 class Portfolio:
@@ -142,24 +290,11 @@ class BacktestRunner:
         self.marks: Dict[str, float] = {}
         self.trade_log: List[TradeRecord] = []
         self.equity_curve: List[Dict] = []
+        self.arb_metrics: ArbReplayState = ArbReplayState()
 
     # ------------------------------------------------------------------
     def _price_from_row(self, row: pd.Series) -> Tuple[float, float, float]:
-        bid = float(row.get("bid", np.nan))
-        ask = float(row.get("ask", np.nan))
-        p_mid = float(row.get("p_mid", np.nan))
-        spread = float(row.get("spread", np.nan)) if not pd.isna(row.get("spread")) else np.nan
-
-        if np.isnan(bid) and not np.isnan(p_mid) and not np.isnan(spread):
-            bid = max(p_mid - spread / 2, 0.0)
-        if np.isnan(ask) and not np.isnan(p_mid) and not np.isnan(spread):
-            ask = min(p_mid + spread / 2, 1.0)
-        if np.isnan(p_mid) and not np.isnan(bid) and not np.isnan(ask):
-            p_mid = (bid + ask) / 2
-        if np.isnan(spread) and not np.isnan(bid) and not np.isnan(ask):
-            spread = abs(ask - bid)
-
-        return bid, ask, p_mid
+        return _price_from_series(row)
 
     def _apply_slippage(self, price: float, side: str) -> float:
         if np.isnan(price):
@@ -253,6 +388,9 @@ class BacktestRunner:
         return equity
 
     def run(self) -> Dict:
+        if self.config.arb_enabled:
+            self.arb_metrics = replay_structural_arb(self.snapshots, self.config)
+
         portfolio = Portfolio()
         last_equity = portfolio.cash
 
@@ -398,6 +536,7 @@ class BacktestRunner:
             "hit_rate": float(hit_rate),
             "avg_edge": float(avg_edge),
             "per_market_unrealized": per_market,
+            "arb_metrics": self.arb_metrics.__dict__ if self.arb_metrics else {},
         }
 
     def _write_outputs(self, equity_df: pd.DataFrame, trades_df: pd.DataFrame, summary: Dict):

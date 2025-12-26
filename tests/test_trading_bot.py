@@ -14,7 +14,7 @@ class FakeFetcher:
     def get_token_ids_for_market(self, market):
         return "YES", "NO"
 
-    def get_orderbook(self, token_id):  # noqa: ARG002
+    def get_orderbook(self, token_id, depth=None):  # noqa: ARG002
         return {"bids": [[self.bid, 100]], "asks": [[self.ask, 100]]}
 
     def get_trades(self, token_id, limit=200):  # noqa: ARG002

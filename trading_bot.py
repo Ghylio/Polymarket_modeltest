@@ -8,15 +8,17 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import PolymarketPredictor
 from sentiment.store import DocumentStore
 from bot.market_filters import MarketFilterConfig, should_trade_market
+from bot.strategy_structural_arb import StructuralArbConfig, StructuralArbStrategy
 from metrics import MetricsLogger, create_run_dir
 
 
@@ -48,6 +50,29 @@ class TradingBotConfig:
     rules_min_length: int = 40
     ambiguous_keywords: Tuple[str, ...] = ("subjective", "opinion", "criteria", "discretion")
     skip_if_time_to_resolve_lt: float = 600.0
+    # Structural arbitrage
+    structural_arb: StructuralArbConfig = field(default_factory=StructuralArbConfig)
+
+
+def load_trading_bot_config(path: Path | str = "config/trading_bot_config.yaml") -> TradingBotConfig:
+    """Load TradingBotConfig from YAML, applying structural_arb defaults."""
+
+    path = Path(path)
+    data = yaml.safe_load(path.read_text()) if path.exists() else {}
+    if data is None:
+        data = {}
+
+    structural_payload = data.get("structural_arb", {}) or {}
+
+    config_kwargs = {k: v for k, v in data.items() if k != "structural_arb"}
+    cfg = TradingBotConfig(**config_kwargs)
+
+    # Normalize ambiguous keywords to tuple for consistency
+    if isinstance(cfg.ambiguous_keywords, list):
+        cfg.ambiguous_keywords = tuple(cfg.ambiguous_keywords)
+
+    cfg.structural_arb = StructuralArbConfig(**structural_payload)
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +171,28 @@ class LiveMarketState:
 
 
 @dataclass
+class ArbRiskTracker:
+    attempt_loss: float = 0.0
+    last_reset_day: int = field(default_factory=lambda: time.gmtime().tm_yday)
+
+    def _reset_if_new_day(self) -> None:
+        today = time.gmtime().tm_yday
+        if today != self.last_reset_day:
+            self.attempt_loss = 0.0
+            self.last_reset_day = today
+
+    def can_attempt(self, max_loss: float) -> bool:
+        self._reset_if_new_day()
+        if max_loss <= 0:
+            return True
+        return self.attempt_loss < max_loss
+
+    def record_attempt_loss(self, loss: float) -> None:
+        self._reset_if_new_day()
+        self.attempt_loss += max(loss, 0.0)
+
+
+@dataclass
 class RiskManager:
     per_market_cap: float = 500.0
     per_event_cap: float = 1000.0
@@ -154,6 +201,7 @@ class RiskManager:
     cumulative_pnl: float = 0.0
     market_exposure: Dict[str, float] = field(default_factory=dict)
     event_exposure: Dict[str, float] = field(default_factory=dict)
+    arb_tracker: ArbRiskTracker = field(default_factory=ArbRiskTracker)
 
     def can_trade(self, market_id: str, event_id: str, notional: float, last_update: float) -> bool:
         if time.time() - last_update > self.stale_seconds:
@@ -177,6 +225,12 @@ class RiskManager:
 
     def mark_pnl(self, delta: float):
         self.cumulative_pnl += delta
+
+    def can_take_arb(self, max_attempt_loss_per_day: float) -> bool:
+        return self.arb_tracker.can_attempt(max_attempt_loss_per_day)
+
+    def record_arb_attempt_loss(self, loss: float) -> None:
+        self.arb_tracker.record_attempt_loss(loss)
 
     def cancel_all(self):
         self.market_exposure.clear()
@@ -241,6 +295,25 @@ class ProbabilityTradingBot:
             rules_min_length=self.bot_config.rules_min_length,
             ambiguous_keywords=self.bot_config.ambiguous_keywords,
             skip_if_time_to_resolve_lt=self.bot_config.skip_if_time_to_resolve_lt,
+        )
+        arb_config = self.bot_config.structural_arb
+        self.arb_filter_config = MarketFilterConfig(
+            min_24h_volume=self.bot_config.min_24h_volume,
+            max_spread_abs=self.bot_config.max_spread_abs,
+            max_spread_pct=self.bot_config.max_spread_pct,
+            min_top_of_book_depth=self.bot_config.min_top_of_book_depth,
+            min_trades_last_24h=self.bot_config.min_trades_last_24h,
+            skip_if_rules_ambiguous=self.bot_config.skip_if_rules_ambiguous,
+            rules_min_length=self.bot_config.rules_min_length,
+            ambiguous_keywords=self.bot_config.ambiguous_keywords,
+            skip_if_time_to_resolve_lt=self.bot_config.skip_if_time_to_resolve_lt,
+        )
+        self.arb_strategy = StructuralArbStrategy(
+            fetcher=self.fetcher,
+            risk_manager=self.risk,
+            config=arb_config,
+            filter_config=self.arb_filter_config,
+            metrics_logger=self.metrics_logger,
         )
         self.last_eval: Dict[str, Dict] = {}
         self.backoff_until: Dict[str, float] = {}
@@ -393,6 +466,28 @@ class ProbabilityTradingBot:
             return {"side": "SELL_YES", "price": bid}
         return None
 
+    def _evaluate_structural_arbitrage(self, markets: List[Dict]) -> Set[str]:
+        executed_events: Set[str] = set()
+        if not self.bot_config.structural_arb.arb_enabled:
+            return executed_events
+
+        self.arb_strategy.reset_cycle()
+        groups: Dict[str, List[Dict]] = {}
+        for market in markets:
+            event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId")
+            if not event_id:
+                continue
+            groups.setdefault(event_id, []).append(market)
+
+        for event_id, group_markets in groups.items():
+            if len(group_markets) < 2:
+                continue
+            result = self.arb_strategy.evaluate_event_group(group_markets)
+            if result and result.get("status") == "filled":
+                executed_events.add(str(event_id))
+
+        return executed_events
+
     def process_market(self, market: Dict) -> Optional[Dict]:
         token_id, state = self._get_market_state(market)
         if not token_id:
@@ -529,8 +624,13 @@ class ProbabilityTradingBot:
     def run_once(self, limit: int = 10) -> List[Dict]:
         markets = self.fetcher.get_markets(limit=limit, order="volume24hr")
         executed: List[Dict] = []
+        arb_events = self._evaluate_structural_arbitrage(markets)
+
         for market in markets:
             try:
+                event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId")
+                if event_id and str(event_id) in arb_events:
+                    continue
                 result = self.process_market(market)
                 if result:
                     executed.append(result)

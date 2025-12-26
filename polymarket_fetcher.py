@@ -229,10 +229,12 @@ class PolymarketFetcher:
     # CLOB API - Orderbook and Trades
     # =========================================================================
     
-    def get_orderbook(self, token_id: str) -> Dict:
+    def get_orderbook(self, token_id: str, depth: int | None = None) -> Dict:
         """Get current orderbook for a token"""
         url = f"{self.CLOB_URL}/book"
         params = {'token_id': token_id}
+        if depth:
+            params['depth'] = depth
         
         data = self._request(url, params)
         
@@ -598,24 +600,33 @@ class PolymarketFetcher:
     # Helper Methods
     # =========================================================================
     
+    def get_outcome_token_map(self, market: Dict) -> Optional[Dict[str, Optional[Dict]]]:
+        """Return detailed mapping between outcomes and token IDs for a market."""
+        try:
+            return build_outcome_token_map(market)
+        except ValueError as exc:
+            self._log(str(exc))
+            return None
+
     def get_token_ids_for_market(self, market: Dict) -> Tuple[Optional[str], Optional[str]]:
-        """Extract YES and NO token IDs from market"""
-        clob_tokens = market.get('clobTokenIds')
-        
-        if clob_tokens:
-            if isinstance(clob_tokens, str):
-                try:
-                    tokens = json.loads(clob_tokens)
-                except:
-                    tokens = []
-            else:
-                tokens = clob_tokens
-            
-            yes_token = tokens[0] if len(tokens) > 0 else None
-            no_token = tokens[1] if len(tokens) > 1 else None
-            return yes_token, no_token
-        
-        return None, None
+        """
+        Extract YES and NO token IDs from market for backward compatibility.
+
+        For binary markets with explicit Yes/No outcomes, this will return the
+        correct mapping regardless of ordering. For other markets, it falls back
+        to the first two token IDs to preserve historical behavior.
+        """
+        tokens = parse_list(market.get('clobTokenIds')) or []
+
+        mapping = self.get_outcome_token_map(market)
+        yes_token = mapping.get('yes_token_id') if mapping else None
+        no_token = mapping.get('no_token_id') if mapping else None
+
+        if yes_token is None and tokens:
+            yes_token = tokens[0]
+            no_token = tokens[1] if len(tokens) > 1 else no_token
+
+        return yes_token, no_token
     
     def trades_to_dataframe(self, trades: List[Dict]) -> pd.DataFrame:
         """Convert trades to DataFrame"""
@@ -657,6 +668,76 @@ class PolymarketFetcher:
         self._markets_cache.clear()
         self._cache_timestamps.clear()
         self._log("Cache cleared")
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def parse_list(value):
+    """
+    Parse a value that may be a list or a JSON-encoded list.
+
+    Returns a list of strings when successful, otherwise None.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        return [str(item) for item in value]
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(decoded, list):
+            return [str(item) for item in decoded]
+
+    return None
+
+
+def build_outcome_token_map(market: Dict) -> Optional[Dict[str, Optional[Dict]]]:
+    """
+    Build a mapping between market outcomes and token IDs.
+
+    The mapping rule is outcome[i] corresponds to clobTokenIds[i].
+    Returns a dictionary containing the market id, original lists, mapping, and
+    binary yes/no token ids when applicable.
+    """
+    outcomes = parse_list(market.get('outcomes')) or []
+    token_ids = parse_list(market.get('clobTokenIds')) or []
+    market_id = market.get('id') or market.get('conditionId')
+
+    if not outcomes or not token_ids:
+        return None
+
+    if len(outcomes) != len(token_ids):
+        raise ValueError(
+            f"Mismatch between outcomes ({len(outcomes)}) and token_ids ({len(token_ids)}) for market {market_id}"
+        )
+
+    outcome_token_map = {outcome: token_ids[idx] for idx, outcome in enumerate(outcomes)}
+
+    yes_token_id = None
+    no_token_id = None
+    for outcome, token in outcome_token_map.items():
+        lower_outcome = str(outcome).lower()
+        if lower_outcome == 'yes':
+            yes_token_id = token
+        elif lower_outcome == 'no':
+            no_token_id = token
+
+    return {
+        'market_id': market_id,
+        'outcomes': outcomes,
+        'token_ids': token_ids,
+        'outcome_token_map': outcome_token_map,
+        'yes_token_id': yes_token_id,
+        'no_token_id': no_token_id,
+    }
 
 
 # =============================================================================

@@ -9,7 +9,7 @@ class FakeFetcher:
         # asks: dict token -> best ask
         self.asks = asks
 
-    def get_orderbook(self, token_id):
+    def get_orderbook(self, token_id, depth=None):  # noqa: ARG002
         price = self.asks[token_id]
         return {"asks": [[price, 100]], "bids": [[price - 0.1, 50]]}
 

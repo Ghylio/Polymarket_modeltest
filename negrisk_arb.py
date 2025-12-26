@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
 from polymarket_fetcher import PolymarketFetcher
-from trading_bot import RiskManager
 from bot.market_filters import MarketFilterConfig, should_trade_market
+
+if TYPE_CHECKING:  # pragma: no cover
+    from trading_bot import RiskManager
 
 
 @dataclass
@@ -63,14 +65,19 @@ class NegRiskArbitrageur:
         self,
         fetcher: Optional[PolymarketFetcher] = None,
         executor: Optional[OrderExecutor] = None,
-        risk_manager: Optional[RiskManager] = None,
+        risk_manager: Optional["RiskManager"] = None,
         config: Optional[NegRiskConfig] = None,
         filter_config: Optional[MarketFilterConfig] = None,
         apply_filters: bool = True,
     ):
         self.fetcher = fetcher or PolymarketFetcher(verbose=False)
         self.executor = executor or PaperBatchExecutor()
-        self.risk = risk_manager or RiskManager()
+        if risk_manager is None:
+            from trading_bot import RiskManager
+
+            self.risk = RiskManager()
+        else:
+            self.risk = risk_manager
         self.config = config or NegRiskConfig()
         self.filter_config = filter_config or MarketFilterConfig()
         self.apply_filters = apply_filters

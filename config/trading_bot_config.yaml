@@ -20,3 +20,28 @@ ambiguous_keywords:
   - criteria
   - discretion
 skip_if_time_to_resolve_lt: 600
+# Structural arbitrage
+structural_arb:
+  enabled: false
+  allow_non_negrisk: false
+  max_legs_per_event: 15
+  max_outcomes: 15
+
+  min_edge_abs: 0.02
+  slippage_bps: 10
+  fee_bps: 0
+
+  min_depth_per_leg_usdc: 250
+  max_usdc_per_event: 2000
+  max_usdc_per_cycle: 500
+
+  depth_robustness_enabled: true
+  depth_robustness_ticks: 1
+  depth_robustness_max_extra_cost_abs: 0.01
+  min_depth_within_band_usdc: 250
+
+  use_fok_or_ioc: true
+  cooldown_after_partial_fill_sec: 300
+  max_attempt_loss_per_day: 50
+
+  max_batches_per_minute: 20
