@@ -19,6 +19,7 @@ from polymarket_fetcher import PolymarketFetcher
 from prediction_model import PolymarketPredictor
 from realtime_market import BookUpdate, RealtimeMarketStream
 from sentiment.store import DocumentStore
+from research.store import ResearchFeatureStore
 from bot.market_filters import MarketFilterConfig, should_trade_market
 from bot.strategy_structural_arb import StructuralArbConfig, StructuralArbStrategy
 from metrics import MetricsLogger, create_run_dir
@@ -296,6 +297,9 @@ class ProbabilityTradingBot:
         bot_config: Optional[TradingBotConfig] = None,
         sentiment_db_path: Optional[Path | str] = None,
         sentiment_store: Optional[DocumentStore] = None,
+        research_db_path: Optional[Path | str] = None,
+        research_store: Optional[ResearchFeatureStore] = None,
+        use_research: bool = False,
         run_dir: Optional[str] = None,
         metrics_logger: Optional[MetricsLogger] = None,
         enable_realtime: bool = True,
@@ -308,6 +312,11 @@ class ProbabilityTradingBot:
         self.predictor.metrics_logger = self.metrics_logger
         self.sentiment_store = sentiment_store or self._maybe_init_store(sentiment_db_path)
         self.predictor.set_sentiment_store(self.sentiment_store)
+        self.research_store = research_store or (
+            self._maybe_init_research_store(research_db_path) if use_research else None
+        )
+        if self.research_store:
+            self.predictor.set_research_store(self.research_store)
         self.threshold = threshold
         self.paper = paper_trading
         self.risk = RiskManager(**(risk_config or {}))
@@ -368,6 +377,19 @@ class ProbabilityTradingBot:
             return DocumentStore(path)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to initialize sentiment store %s: %s", path, exc)
+            return None
+
+    def _maybe_init_research_store(
+        self, research_db_path: Optional[Path | str]
+    ) -> Optional[ResearchFeatureStore]:
+        path = Path(research_db_path) if research_db_path else Path(os.environ.get("RESEARCH_DB", "data/sentiment.db"))
+        if not path.exists():
+            logger.info("Research store %s not found; proceeding with default research features", path)
+            return None
+        try:
+            return ResearchFeatureStore(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to initialize research store %s: %s", path, exc)
             return None
 
     # ------------------------------------------------------------------

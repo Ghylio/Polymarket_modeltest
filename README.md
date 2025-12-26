@@ -66,6 +66,20 @@ python -m sentiment.ingest --db data/sentiment.db --config config/sentiment_conf
 
 The service runs independently of the trading loop, deduplicates documents, and upserts rolling aggregates (1h/6h/24h/7d) into the SQLite store.
 
+## Research features (optional)
+
+A separate `research_features` table can be stored in the existing `data/sentiment.db` SQLite file (or a custom path) to hold hourly LLM research signals. The schema includes probability/confidence fields, evidence counts, stance scores, ambiguity flags, and the original JSON payload. Snapshot generation (`python -m data.build_snapshots`) can join these columns when `--use-research` is supplied, using the snapshot timestamp as a hard cutoff to avoid leakage. Live inference uses the same cutoff (latest tick timestamp) and fills missing values with `NaN` (or `0` for count fields) so feature alignment remains consistent even when no research rows are present.
+
+When documents are sparse, the ingestion loop falls back to a **rules-only** parser that inspects the market rules/description to set `rules_ambiguous`, `resolution_source_type`, and an `ambiguity_score` without incurring LLM costs.
+
+To continuously refresh research signals without blocking trading, run the background ingestion loop alongside sentiment ingestion:
+
+```
+python -m research.ingest_service --db data/sentiment.db --interval_sec 300 --max_markets 50
+```
+
+The service opportunistically selects active markets, gathers recent documents from the local `DocumentStore`, builds a strict JSON prompt, and calls the configured LLM (model/limits in `config/research_config.yaml`). Results are cached by hour bucket to avoid duplicate writes and are stored via the `research_features` schema. Because the trading loop only reads from SQLite, no live LLM calls occur during trading.
+
 ## Backtest
 
 Replay snapshot-based trades with the probability bot rules in paper mode:

@@ -33,6 +33,8 @@ from data.subgraph_config import load_subgraph_config
 from data.subgraph_features import SubgraphFeatureJoiner
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import MarketFeatureExtractor
+from research.schema import RESEARCH_COLUMNS, canonicalize_research_features
+from research.store import ResearchFeatureStore
 from sentiment.store import DocumentStore, aggregate_scores
 
 try:  # Parquet dependency is optional at runtime
@@ -64,6 +66,9 @@ class SnapshotBuilder:
     sentiment_db_path: Path = Path("data/sentiment.db")
     allow_online_sentiment_fetch: bool = False
     sentiment_store: Optional[DocumentStore] = None
+    use_research: bool = False
+    research_db_path: Path = Path("data/sentiment.db")
+    research_store: Optional[ResearchFeatureStore] = None
     use_subgraph: bool = False
     subgraph_client: Optional[SubgraphClient] = None
     subgraph_joiner: Optional[SubgraphFeatureJoiner] = None
@@ -79,6 +84,12 @@ class SnapshotBuilder:
             DocumentStore(self.sentiment_db_path) if self.use_sentiment else None
         )
         self.allow_online_sentiment_fetch = bool(self.allow_online_sentiment_fetch)
+
+        self.use_research = bool(self.use_research)
+        self.research_store = self.research_store or (
+            ResearchFeatureStore(self.research_db_path) if self.use_research else None
+        )
+        self.research_coverage: Tuple[int, int] = (0, 0)  # (rows_with_research, total_rows)
 
         if self.use_sentiment:
             providers = build_providers_from_config(cfg)
@@ -158,6 +169,16 @@ class SnapshotBuilder:
                 coverage_pct,
                 with_docs,
                 total,
+            )
+
+        if self.research_store and self.research_coverage[1] > 0:
+            with_research, total_rows = self.research_coverage
+            coverage_pct = 100.0 * with_research / float(total_rows)
+            self.logger.info(
+                "Research coverage: %.1f%% snapshots had research features (\%s/%s)",
+                coverage_pct,
+                with_research,
+                total_rows,
             )
 
         if self.subgraph_joiner:
@@ -250,6 +271,16 @@ class SnapshotBuilder:
             else:
                 sentiment_features = canonicalize_sentiment_features({})
 
+            research_features: Dict[str, float] = {}
+            if self.research_store:
+                research_features, found = self._research_features_from_store(
+                    market_id=market_id, snapshot_ts=pd.to_datetime(snapshot_ts)
+                )
+                found_count, total_count = self.research_coverage
+                self.research_coverage = (found_count + int(found), total_count + 1)
+            else:
+                research_features = canonicalize_research_features({})
+
             rows.append(
                 {
                     "schema_version": self.schema_version,
@@ -267,6 +298,7 @@ class SnapshotBuilder:
                     "y": label,
                     **feature_dict,
                     **sentiment_features,
+                    **research_features,
                 }
             )
 
@@ -275,6 +307,12 @@ class SnapshotBuilder:
             for row in rows:
                 for col in SENTIMENT_COLUMNS:
                     row.setdefault(col, np.nan)
+
+        # Ensure all research columns exist in every row for downstream consistency
+        if rows and self.research_store:
+            for row in rows:
+                for col in RESEARCH_COLUMNS:
+                    row.setdefault(col, canonicalize_research_features({}).get(col, np.nan))
 
         return rows
 
@@ -416,6 +454,24 @@ class SnapshotBuilder:
 
         return canonicalize_sentiment_features(features)
 
+    def _research_features_from_store(
+        self, market_id: str, snapshot_ts: datetime
+    ) -> Tuple[Dict[str, float], bool]:
+        if not self.research_store:
+            return canonicalize_research_features({}), False
+
+        try:
+            features, found = self.research_store.fetch_latest_features(
+                market_id=market_id,
+                cutoff_ts=int(snapshot_ts.timestamp()),
+                return_found=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            self.logger.warning("Research fetch failed for %s: %s", market_id, exc)
+            return canonicalize_research_features({}), False
+
+        return canonicalize_research_features(features), bool(found)
+
     def _fetch_resolved_markets(
         self, limit: int = 50, min_volume: float = 0
     ) -> List[Dict]:
@@ -464,12 +520,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Allow online sentiment provider fetch if local store missing",
     )
+    parser.add_argument(
+        "--research-db",
+        type=Path,
+        default=Path("data/sentiment.db"),
+        help="Path to local research SQLite database",
+    )
+    parser.add_argument(
+        "--use-research",
+        action="store_true",
+        help="Enable joining research features into snapshots",
+    )
 
     args = parser.parse_args(argv)
 
     builder = SnapshotBuilder(
         sentiment_db_path=args.sentiment_db,
         allow_online_sentiment_fetch=args.allow_online_sentiment_fetch,
+        use_research=args.use_research,
+        research_db_path=args.research_db,
     )
     dataset = builder.fetch_and_build(
         limit=args.limit, min_volume=args.min_volume, fidelity=args.fidelity
