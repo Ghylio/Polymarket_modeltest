@@ -9,6 +9,7 @@ from typing import Iterable, List, Optional
 import pandas as pd
 
 from data.sentiment_features import SENTIMENT_COLUMNS, SENTIMENT_ALIAS_MAP
+from research.schema import RESEARCH_COLUMNS
 
 
 REQUIRED_COLUMNS = {
@@ -35,6 +36,8 @@ class SnapshotDataset:
     dataset_path: Path
     sentiment_feature_columns: List[str]
     sentiment_enabled: bool
+    research_feature_columns: List[str]
+    research_enabled: bool
 
 
 class SnapshotDatasetLoader:
@@ -56,6 +59,7 @@ class SnapshotDatasetLoader:
         val_fraction: float = 0.2,
         required_extra: Optional[Iterable[str]] = None,
         use_sentiment: bool = True,
+        use_research: bool = True,
     ) -> SnapshotDataset:
         """Load parquet snapshots and return train/val splits without leakage."""
 
@@ -126,6 +130,11 @@ class SnapshotDatasetLoader:
 
         sentiment_feature_columns = [c for c in feature_columns if c in SENTIMENT_COLUMNS]
 
+        if not use_research:
+            feature_columns = [c for c in feature_columns if c not in RESEARCH_COLUMNS]
+        research_feature_columns = [c for c in feature_columns if c in RESEARCH_COLUMNS]
+        research_enabled = bool(research_feature_columns)
+
         train_df = df[df[self.market_col].isin(train_markets)].copy()
         val_df = df[df[self.market_col].isin(val_markets)].copy()
 
@@ -148,5 +157,7 @@ class SnapshotDatasetLoader:
             dataset_path=path,
             sentiment_feature_columns=sentiment_feature_columns,
             sentiment_enabled=sentiment_enabled,
+            research_feature_columns=research_feature_columns,
+            research_enabled=research_enabled,
         )
 

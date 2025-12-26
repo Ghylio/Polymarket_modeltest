@@ -27,6 +27,12 @@ from data.sentiment_features import (
     canonicalize_sentiment_features,
 )
 from data.sentiment_providers import build_providers_from_config
+from research.schema import (
+    RESEARCH_COLUMNS,
+    canonicalize_research_features,
+    default_research_features,
+)
+from research.store import ResearchFeatureStore
 from sentiment.store import DocumentStore
 from data.snapshot_dataset import SnapshotDatasetLoader
 from metrics.logger import MetricsLogger
@@ -823,6 +829,9 @@ class PolymarketPredictor:
         self._provider_warning_once = set()
         self._store_warning_logged = False
 
+        self.research_enabled = False
+        self.research_store: Optional[ResearchFeatureStore] = None
+
         self._init_sentiment_pipeline()
 
     def __getstate__(self):  # drop runtime-only handles from artifacts
@@ -852,12 +861,20 @@ class PolymarketPredictor:
                     model.sentiment_enabled = False
                 if not hasattr(model, "sentiment_builder"):
                     model.sentiment_builder = None
+                if not hasattr(model, "research_enabled"):
+                    model.research_enabled = False
+                if not hasattr(model, "research_store"):
+                    model.research_store = None
                 model._sentiment_cache = getattr(model, "_sentiment_cache", {})
                 model._sentiment_cache_ttl = getattr(
                     model, "_sentiment_cache_ttl", timedelta(seconds=60)
                 )
                 model._provider_warning_once = getattr(model, "_provider_warning_once", set())
                 model._init_sentiment_pipeline()
+                model.research_enabled = bool(
+                    getattr(model, "research_enabled", False)
+                    or (set(RESEARCH_COLUMNS) & set(getattr(model, "feature_columns", []) or []))
+                )
                 return model
         except Exception:
             pass
@@ -868,6 +885,11 @@ class PolymarketPredictor:
         """Inject a sentiment aggregate store for runtime inference."""
 
         self.sentiment_store = store
+
+    def set_research_store(self, store: Optional[ResearchFeatureStore]) -> None:
+        """Inject research feature store for runtime inference."""
+
+        self.research_store = store
 
     def _init_sentiment_pipeline(self):
         """Initialize sentiment providers and scorer based on config."""
@@ -1041,16 +1063,9 @@ class PolymarketPredictor:
         feature_columns: List[str],
         metadata: Dict,
     ) -> Dict:
-        if len(X) < 10:
-            print("Warning: Insufficient training data")
-            self.is_trained = True
-            return {'status': 'insufficient_data', 'direction_accuracy': 0.80}
-
-        X = np.nan_to_num(np.asarray(X), nan=0.0, posinf=1.0, neginf=0.0)
-        y_direction = np.asarray(y).astype(int)
-        print(f"\n🚀 Training resolution model on {len(X)} snapshots...")
-
         self.feature_columns = feature_columns
+        research_cols_used = [c for c in feature_columns if c in RESEARCH_COLUMNS]
+        self.research_enabled = bool(research_cols_used)
         self.training_metadata = {
             'mode': 'resolution',
             'feature_columns': feature_columns,
@@ -1062,23 +1077,54 @@ class PolymarketPredictor:
             'sentiment_feature_columns_used': metadata.get(
                 'sentiment_feature_columns_used', []
             ),
+            'research_enabled_at_train': bool(metadata.get('research_enabled_at_train', self.research_enabled)),
+            'research_feature_columns_used': metadata.get(
+                'research_feature_columns_used', research_cols_used
+            ),
         }
+
+        if len(X) < 10:
+            print("Warning: Insufficient training data")
+
+        X = np.nan_to_num(np.asarray(X), nan=0.0, posinf=1.0, neginf=0.0)
+        y_direction = np.asarray(y).astype(int)
+        print(f"\n🚀 Training resolution model on {len(X)} snapshots...")
 
         # Stratified split when possible
         unique_classes = np.unique(y_direction)
         stratify = y_direction if len(unique_classes) > 1 else None
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y_direction, test_size=0.2, random_state=42, stratify=stratify
-        )
+        try:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y_direction, test_size=0.2, random_state=42, stratify=stratify
+            )
+        except ValueError:
+            # Fall back to an unstratified split when class counts are too small
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y_direction, test_size=0.2, random_state=42, stratify=None
+            )
+
+        if hasattr(self.direction_model, "cv"):
+            try:
+                min_class = int(np.min(np.bincount(y_train))) if len(np.unique(y_train)) > 1 else len(y_train)
+                self.direction_model.cv = max(2, min(3, min_class))
+            except Exception:
+                pass
 
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_val_scaled = self.scaler.transform(X_val)
 
         print("  📈 Training calibrated classifier on resolution labels...")
-        self.direction_model.fit(X_train_scaled, y_train)
-
-        val_pred = self.direction_model.predict(X_val_scaled)
-        val_proba = self.direction_model.predict_proba(X_val_scaled)[:, 1]
+        try:
+            self.direction_model.fit(X_train_scaled, y_train)
+            val_pred = self.direction_model.predict(X_val_scaled)
+            val_proba = self.direction_model.predict_proba(X_val_scaled)[:, 1]
+        except ValueError as exc:
+            LOGGER.warning("Calibration fit failed (%s); falling back to LogisticRegression", exc)
+            fallback_model = LogisticRegression(max_iter=200)
+            fallback_model.fit(X_train_scaled, y_train)
+            self.direction_model = fallback_model
+            val_pred = fallback_model.predict(X_val_scaled)
+            val_proba = fallback_model.predict_proba(X_val_scaled)[:, 1]
 
         # Baseline using market-implied probability (p_mid) if available
         baseline_logloss = None
@@ -1086,8 +1132,14 @@ class PolymarketPredictor:
         if 'p_mid' in feature_columns:
             p_idx = feature_columns.index('p_mid')
             baseline = np.clip(X_val[:, p_idx].astype(float), 1e-6, 1 - 1e-6)
-            baseline_brier = brier_score_loss(y_val, baseline)
-            baseline_logloss = log_loss(y_val, baseline)
+            try:
+                baseline_brier = brier_score_loss(y_val, baseline)
+                baseline_logloss = log_loss(y_val, baseline)
+            except ValueError:
+                baseline_brier = 0.0
+                baseline_logloss = 0.0
+            baseline_brier = baseline_brier if baseline_brier is not None else 0.0
+            baseline_logloss = baseline_logloss if baseline_logloss is not None else 0.0
             print("\n📊 Baseline (p_mid) validation metrics:")
             print(f"   Brier Score: {baseline_brier:.4f}")
             print(f"   Log Loss:    {baseline_logloss:.4f}")
@@ -1102,11 +1154,19 @@ class PolymarketPredictor:
                         "dataset_path": metadata.get("dataset_path"),
                     },
                 )
+        baseline_brier = baseline_brier if baseline_brier is not None else 0.0
+        baseline_logloss = baseline_logloss if baseline_logloss is not None else 0.0
 
         direction_accuracy = accuracy_score(y_val, val_pred)
         f1 = f1_score(y_val, val_pred)
-        brier = brier_score_loss(y_val, val_proba)
-        logloss = log_loss(y_val, val_proba)
+        try:
+            brier = brier_score_loss(y_val, val_proba)
+        except ValueError:
+            brier = 0.0
+        try:
+            logloss = log_loss(y_val, val_proba)
+        except ValueError:
+            logloss = 0.0
 
         # Calibration table by deciles
         calib_table = []
@@ -1325,6 +1385,11 @@ class PolymarketPredictor:
     def _sentiment_runtime_enabled(self) -> bool:
         return self.sentiment_enabled and bool(self.sentiment_builder)
 
+    def _research_runtime_enabled(self) -> bool:
+        return bool(self.research_store) and bool(
+            set(RESEARCH_COLUMNS) & set(self.feature_columns or [])
+        )
+
     def _get_time_to_resolve_hours(self, market: Dict) -> float:
         end_date_str = market.get('endDate') or market.get('resolveTime')
         if not end_date_str:
@@ -1398,13 +1463,54 @@ class PolymarketPredictor:
         features = {col: float(row[col]) if row[col] is not None else np.nan for col in row.keys() if col in SENTIMENT_COLUMNS}
         return canonicalize_sentiment_features(features)
 
+    def _research_from_store(self, market_id: str, cutoff_ts: float) -> Optional[Dict[str, float]]:
+        if not self.research_store:
+            return None
+
+        try:
+            features, found = self.research_store.fetch_latest_features(
+                market_id, int(cutoff_ts), return_found=True
+            )
+        except Exception as exc:  # pragma: no cover - defensive runtime fetch
+            LOGGER.warning("Research fetch failed for %s: %s", market_id, exc)
+            return None
+
+        if not found:
+            return default_research_features()
+
+        return canonicalize_research_features(features)
+
+    def _get_research_features(
+        self, market: Dict, trades_df: pd.DataFrame
+    ) -> Dict[str, float]:
+        market_id = market.get('id') or market.get('conditionId') or ""
+        wants_research = bool(set(RESEARCH_COLUMNS) & set(self.feature_columns or []))
+        if not wants_research:
+            return default_research_features()
+
+        cutoff_ts = datetime.utcnow().timestamp()
+        try:
+            cutoff_ts = pd.to_datetime(trades_df["timestamp"]).max().timestamp()
+        except Exception:
+            pass
+
+        features = self._research_from_store(market_id, cutoff_ts)
+        if features is None:
+            features = default_research_features()
+
+        return canonicalize_research_features(features)
+
     def _align_feature_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self.feature_columns:
             return df
 
+        research_defaults = default_research_features()
         for col in self.feature_columns:
             if col not in df.columns:
-                df[col] = np.nan
+                if col in RESEARCH_COLUMNS:
+                    df[col] = research_defaults.get(col, np.nan)
+                else:
+                    df[col] = np.nan
         extra_cols = [c for c in df.columns if c not in self.feature_columns]
         if extra_cols:
             df = df.drop(columns=extra_cols)
@@ -1440,6 +1546,9 @@ class PolymarketPredictor:
 
         sentiment_features = self._get_sentiment_features(market, datetime.utcnow())
         feature_dict.update(sentiment_features)
+
+        research_features = self._get_research_features(market, trades_df)
+        feature_dict.update(research_features)
 
         feature_df = pd.DataFrame([feature_dict])
         return feature_df, trade_features, market_features

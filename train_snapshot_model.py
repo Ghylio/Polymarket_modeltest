@@ -52,6 +52,8 @@ def main(argv=None) -> int:
                 "dataset_path": str(dataset.dataset_path),
                 "sentiment_enabled_at_train": dataset.sentiment_enabled,
                 "sentiment_feature_columns_used": dataset.sentiment_feature_columns,
+                "research_enabled_at_train": dataset.research_enabled,
+                "research_feature_columns_used": dataset.research_feature_columns,
             },
             metrics_logger=metrics_logger,
         )

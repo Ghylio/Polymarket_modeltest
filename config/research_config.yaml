@@ -1,0 +1,8 @@
+model: gpt-4o-mini
+top_k: 12
+window_hours_short: 24
+window_hours_long: 168
+use_embeddings: false
+exploration_rate: 0.1
+rate_limit_per_min: 30
+min_docs_for_llm: 1
