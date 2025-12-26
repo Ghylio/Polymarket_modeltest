@@ -6,3 +6,12 @@ use_embeddings: false
 exploration_rate: 0.1
 rate_limit_per_min: 30
 min_docs_for_llm: 1
+research:
+  enabled: true
+  openai_model_primary: "gpt-5-mini"
+  openai_model_fallback: "gpt-5.2"
+  structured_outputs: true
+  store: false
+  fallback_confidence_threshold: 0.55
+  request_timeout_sec: 60
+  max_retries: 3

@@ -20,6 +20,7 @@ shap>=0.44.0
 requests>=2.31.0
 websocket-client>=1.6.0
 transformers>=4.38.0
+openai>=1.0.0
 
 # Visualization (optional)
 matplotlib>=3.7.0
