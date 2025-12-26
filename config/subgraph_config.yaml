@@ -1,0 +1,5 @@
+subgraph:
+  enabled: false
+  url: https://api.thegraph.com/subgraphs/name/polymarket/matic-markets
+  resolution_url: https://api.thegraph.com/subgraphs/name/polymarket/resolutions
+  volume_lookback_hours: 24

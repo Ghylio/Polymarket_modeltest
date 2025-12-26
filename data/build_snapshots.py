@@ -28,6 +28,9 @@ from data.sentiment_features import (
     canonicalize_sentiment_features,
 )
 from data.sentiment_providers import build_providers_from_config
+from data.subgraph_client import SubgraphClient
+from data.subgraph_config import load_subgraph_config
+from data.subgraph_features import SubgraphFeatureJoiner
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import MarketFeatureExtractor
 from sentiment.store import DocumentStore, aggregate_scores
@@ -61,6 +64,9 @@ class SnapshotBuilder:
     sentiment_db_path: Path = Path("data/sentiment.db")
     allow_online_sentiment_fetch: bool = False
     sentiment_store: Optional[DocumentStore] = None
+    use_subgraph: bool = False
+    subgraph_client: Optional[SubgraphClient] = None
+    subgraph_joiner: Optional[SubgraphFeatureJoiner] = None
 
     def __post_init__(self):
         self.logger = logging.getLogger(__name__)
@@ -82,6 +88,22 @@ class SnapshotBuilder:
             )
         else:
             self.sentiment_builder = None
+
+        sg_cfg = load_subgraph_config()
+        self.use_subgraph = self.use_subgraph or bool(
+            sg_cfg.get("subgraph", {}).get("enabled", False)
+        )
+        if self.use_subgraph:
+            volume_lookback = sg_cfg.get("subgraph", {}).get("volume_lookback_hours", 24)
+            self.subgraph_client = self.subgraph_client or SubgraphClient(
+                subgraph_url=sg_cfg.get("subgraph", {}).get("url"),
+                resolution_url=sg_cfg.get("subgraph", {}).get("resolution_url"),
+            )
+            self.subgraph_joiner = SubgraphFeatureJoiner(
+                client=self.subgraph_client,
+                volume_lookback_hours=int(volume_lookback),
+                enabled=True,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,6 +159,9 @@ class SnapshotBuilder:
                 with_docs,
                 total,
             )
+
+        if self.subgraph_joiner:
+            df = self.subgraph_joiner.enrich_snapshots(df)
         return df.sort_values(["market_id", "snapshot_ts"]).reset_index(drop=True)
 
     def fetch_and_build(
