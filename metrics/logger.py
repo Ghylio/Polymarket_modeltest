@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 
 DEFAULT_RESULTS_DIR = Path("results")
+ARB_EVENT_TYPES = {"arb_opportunity", "arb_trade", "arb_partial_fill", "arb_skip"}
 
 
 def create_run_dir(base: Path = DEFAULT_RESULTS_DIR, prefix: str = "run") -> Path:

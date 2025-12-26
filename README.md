@@ -105,6 +105,8 @@ Trading, backtesting, and NegRisk arbitration all call a shared market-quality f
 
 Lowering thresholds increases coverage but risks stale/illiquid fills; tightening them improves execution quality at the cost of fewer opportunities. Skip reasons are logged to aid tuning.
 
+Structural arbitrage evaluations add a depth-robustness gate to reduce partial fills: each leg must show sufficient size not only at the best ask but also within a small adverse price band (configurable tick/price buffer). Opportunities are sized off the minimum robust depth across legs, and skips are logged when depth within the band is insufficient. Tune the `structural_arb.depth_robustness_*` settings in `config/trading_bot_config.yaml` to adjust the tolerance.
+
 ## Output
 
 The system provides:
