@@ -19,7 +19,7 @@ class DummyLLMClient:
     def has_cache(self, market_id, bucket):
         return (market_id, bucket) in self._cache
 
-    def call_llm(self, market_id, bucket, prompt):
+    def call_llm(self, market_id, bucket, prompt, schema):  # noqa: ARG002
         self.calls += 1
         self._cache[(market_id, bucket)] = True
         return {"llm_p_yes": 0.6, "llm_confidence": 0.7, "resolution_source_type": "news"}, False

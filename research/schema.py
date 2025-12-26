@@ -17,6 +17,23 @@ RESEARCH_COLUMNS = [
     "ambiguity_score",
 ]
 
+RESEARCH_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "llm_p_yes": {"type": ["number", "null"]},
+        "llm_confidence": {"type": ["number", "null"]},
+        "evidence_count_24h": {"type": ["integer", "null"]},
+        "evidence_count_7d": {"type": ["integer", "null"]},
+        "source_diversity_7d": {"type": ["integer", "null"]},
+        "stance_score_24h": {"type": ["number", "null"]},
+        "stance_score_7d": {"type": ["number", "null"]},
+        "rules_ambiguous": {"type": ["integer", "null"]},
+        "resolution_source_type": {"type": ["string", "null"]},
+        "ambiguity_score": {"type": ["number", "null"]},
+    },
+    "additionalProperties": False,
+}
+
 COUNT_COLUMNS = {"evidence_count_24h", "evidence_count_7d", "source_diversity_7d"}
 BOOLEAN_COLUMNS = {"rules_ambiguous"}
 STRING_COLUMNS = {"resolution_source_type"}
@@ -37,6 +54,10 @@ class ResearchFeatures(BaseModel):
 
     def canonical(self) -> Dict[str, Any]:
         return canonicalize_research_features(self.dict())
+
+    @classmethod
+    def json_schema(cls) -> Dict[str, Any]:
+        return RESEARCH_JSON_SCHEMA
 
 
 def canonicalize_research_features(features: Mapping[str, Any]) -> Dict[str, Any]:

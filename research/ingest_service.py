@@ -13,7 +13,7 @@ import yaml
 
 from metrics.logger import MetricsLogger
 from polymarket_fetcher import PolymarketFetcher
-from research.llm import LLMClient
+from research.llm_openai import ResearchLLMClient
 from research.prompt import build_prompt, parse_llm_output
 from research.rules_only import extract_rules_features
 from research.retrieval import get_market_docs
@@ -40,9 +40,18 @@ def load_research_config(path: Path | None = None) -> Dict:
             "exploration_rate": 0.1,
             "rate_limit_per_min": 30,
             "min_docs_for_llm": DEFAULT_MIN_DOCS_FOR_LLM,
+            "enabled": True,
+            "openai_model_primary": "gpt-5-mini",
+            "openai_model_fallback": "gpt-5.2",
+            "structured_outputs": True,
+            "store": False,
+            "fallback_confidence_threshold": 0.55,
+            "request_timeout_sec": 60,
+            "max_retries": 3,
         }
     with cfg_path.open("r") as f:
         loaded = yaml.safe_load(f) or {}
+    research_cfg = loaded.get("research", {}) or {}
     return {
         "model": loaded.get("model", "gpt-4o-mini"),
         "top_k": int(loaded.get("top_k", 10)),
@@ -52,6 +61,16 @@ def load_research_config(path: Path | None = None) -> Dict:
         "exploration_rate": float(loaded.get("exploration_rate", 0.1)),
         "rate_limit_per_min": int(loaded.get("rate_limit_per_min", 30)),
         "min_docs_for_llm": int(loaded.get("min_docs_for_llm", DEFAULT_MIN_DOCS_FOR_LLM)),
+        "enabled": bool(research_cfg.get("enabled", loaded.get("enabled", True))),
+        "openai_model_primary": research_cfg.get("openai_model_primary", loaded.get("openai_model_primary", "gpt-5-mini")),
+        "openai_model_fallback": research_cfg.get("openai_model_fallback", loaded.get("openai_model_fallback", "gpt-5.2")),
+        "structured_outputs": bool(research_cfg.get("structured_outputs", loaded.get("structured_outputs", True))),
+        "store": bool(research_cfg.get("store", loaded.get("store", False))),
+        "fallback_confidence_threshold": float(
+            research_cfg.get("fallback_confidence_threshold", loaded.get("fallback_confidence_threshold", 0.55))
+        ),
+        "request_timeout_sec": int(research_cfg.get("request_timeout_sec", loaded.get("request_timeout_sec", 60))),
+        "max_retries": int(research_cfg.get("max_retries", loaded.get("max_retries", 3))),
     }
 
 
@@ -60,7 +79,7 @@ class ResearchIngestService:
         self,
         research_store: ResearchFeatureStore,
         document_store: DocumentStore,
-        llm_client: LLMClient,
+        llm_client: ResearchLLMClient,
         fetcher: Optional[PolymarketFetcher] = None,
         metrics_logger: Optional[MetricsLogger] = None,
         config: Optional[Dict] = None,
@@ -104,6 +123,9 @@ class ResearchIngestService:
 
     # ------------------------------------------------------------------
     def run_once(self, as_of_ts: Optional[int] = None) -> None:
+        if not self.config.get("enabled", True):
+            return
+
         now_ts = as_of_ts or int(time.time())
         markets = self.fetcher.get_markets(limit=self.max_markets, active=True, closed=False)
         selected = self.select_markets(markets)
@@ -157,7 +179,8 @@ class ResearchIngestService:
                     continue
 
                 prompt = build_prompt(market, merged_docs, now_ts)
-                llm_result, from_cache = self.llm_client.call_llm(market_id, bucket, prompt)
+                schema = ResearchFeatures.json_schema()
+                llm_result, from_cache = self.llm_client.call_llm(market_id, bucket, prompt, schema)
                 if from_cache:
                     self._log_metric("research_ingest_skip", market_id, bucket, reason="cached")
                     continue
@@ -216,7 +239,16 @@ def main():  # pragma: no cover - CLI wrapper
     cfg = load_research_config(args.config)
     research_store = ResearchFeatureStore(args.db)
     document_store = DocumentStore(args.db)
-    llm_client = LLMClient(cfg.get("model"), rate_limit_per_min=cfg.get("rate_limit_per_min", 30))
+    llm_client = ResearchLLMClient(
+        primary_model=cfg.get("openai_model_primary", "gpt-5-mini"),
+        fallback_model=cfg.get("openai_model_fallback", "gpt-5.2"),
+        rate_limit_per_min=cfg.get("rate_limit_per_min", 30),
+        fallback_confidence_threshold=cfg.get("fallback_confidence_threshold", 0.55),
+        request_timeout_sec=cfg.get("request_timeout_sec", 60),
+        max_retries=cfg.get("max_retries", 3),
+        store=cfg.get("store", False),
+        structured_outputs=cfg.get("structured_outputs", True),
+    )
     metrics_dir = Path("results") / "research_ingest"
     metrics_dir.mkdir(parents=True, exist_ok=True)
     with MetricsLogger(metrics_dir / "run") as logger:
