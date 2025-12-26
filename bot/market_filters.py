@@ -102,11 +102,12 @@ def should_trade_market(
     # Rule ambiguity filter
     if cfg.skip_if_rules_ambiguous:
         rules_text = str(market_metadata.get("rules") or market_metadata.get("description") or "")
-        if len(rules_text.strip()) < cfg.rules_min_length:
-            reasons.append("short_rules")
-        lower_rules = rules_text.lower()
-        if any(keyword in lower_rules for keyword in cfg.ambiguous_keywords):
-            reasons.append("ambiguous_rules")
+        if rules_text.strip():
+            if len(rules_text.strip()) < cfg.rules_min_length:
+                reasons.append("short_rules")
+            lower_rules = rules_text.lower()
+            if any(keyword in lower_rules for keyword in cfg.ambiguous_keywords):
+                reasons.append("ambiguous_rules")
 
     # Time to resolve filter
     if cfg.skip_if_time_to_resolve_lt:

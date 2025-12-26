@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import random
 import time
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ import yaml
 
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import PolymarketPredictor
+from realtime_market import BookUpdate, RealtimeMarketStream
 from sentiment.store import DocumentStore
 from bot.market_filters import MarketFilterConfig, should_trade_market
 from bot.strategy_structural_arb import StructuralArbConfig, StructuralArbStrategy
@@ -144,6 +146,9 @@ class LiveMarketState:
     mid: float = 0.5
     spread: float = 0.0
     depth: float = 0.0
+    last_trade_price: Optional[float] = None
+    last_trade_size: Optional[float] = None
+    last_trade_ts: Optional[float] = None
     last_update: float = field(default_factory=time.time)
 
     @classmethod
@@ -163,6 +168,29 @@ class LiveMarketState:
             spread = 0.0
 
         return cls(bid=best_bid, ask=best_ask, mid=mid, spread=spread, depth=depth, last_update=time.time())
+
+    @classmethod
+    def from_realtime(cls, update: BookUpdate) -> "LiveMarketState":
+        best_bid = update.best_bid
+        best_ask = update.best_ask
+        if not np.isnan(best_bid) and not np.isnan(best_ask) and best_bid > 0 and best_ask > 0:
+            mid = (best_bid + best_ask) / 2
+            spread = abs(best_ask - best_bid)
+        else:
+            mid = 0.5
+            spread = 0.0
+
+        return cls(
+            bid=best_bid,
+            ask=best_ask,
+            mid=mid,
+            spread=spread,
+            depth=update.depth,
+            last_trade_price=update.last_trade_price,
+            last_trade_size=update.last_trade_size,
+            last_trade_ts=update.last_trade_ts,
+            last_update=time.time(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +298,7 @@ class ProbabilityTradingBot:
         sentiment_store: Optional[DocumentStore] = None,
         run_dir: Optional[str] = None,
         metrics_logger: Optional[MetricsLogger] = None,
+        enable_realtime: bool = True,
     ):
         self.fetcher = fetcher or PolymarketFetcher(verbose=False)
         models_dir = models_dir or os.environ.get("POLYMARKET_MODELS", "models")
@@ -318,6 +347,11 @@ class ProbabilityTradingBot:
         self.last_eval: Dict[str, Dict] = {}
         self.backoff_until: Dict[str, float] = {}
         self.backoff_ms: Dict[str, int] = {}
+        self.market_update_queue: "queue.Queue[str]" = queue.Queue()
+        self.realtime_enabled = enable_realtime
+        self.realtime_client: Optional[RealtimeMarketStream] = None
+        self.market_by_id: Dict[str, Dict] = {}
+        self.token_to_market_id: Dict[str, str] = {}
         self.global_limiter = TokenBucketLimiter(
             rate_per_sec=self.bot_config.global_max_evals_per_sec,
             capacity=self.bot_config.global_max_evals_per_sec,
@@ -337,6 +371,69 @@ class ProbabilityTradingBot:
             return None
 
     # ------------------------------------------------------------------
+    def _index_markets(self, markets: List[Dict]) -> None:
+        for market in markets:
+            market_id = market.get("id") or market.get("conditionId")
+            yes_token, _ = self.fetcher.get_token_ids_for_market(market)
+            if market_id and yes_token:
+                self.market_by_id[str(market_id)] = market
+                self.token_to_market_id[str(yes_token)] = str(market_id)
+
+    def _ensure_realtime(self) -> None:
+        if not self.realtime_enabled or not self.token_to_market_id:
+            return
+        if not self.realtime_client:
+            self.realtime_client = RealtimeMarketStream(
+                list(self.token_to_market_id.keys()),
+                on_book=self._on_realtime_book,
+                on_trade=self._on_realtime_trade,
+            )
+            self.realtime_client.start()
+        else:
+            self.realtime_client.update_assets(self.token_to_market_id.keys())
+
+    def _on_realtime_book(self, update: BookUpdate) -> None:
+        market_id = self.token_to_market_id.get(update.asset_id)
+        if not market_id:
+            return
+        state = LiveMarketState.from_realtime(update)
+        # Preserve previous last trade info if this update lacked trades
+        previous = self.live_state.get(market_id)
+        if previous and update.last_trade_ts is None:
+            state.last_trade_price = previous.last_trade_price
+            state.last_trade_size = previous.last_trade_size
+            state.last_trade_ts = previous.last_trade_ts
+        self.live_state[market_id] = state
+        try:
+            self.market_update_queue.put_nowait(market_id)
+        except queue.Full:  # pragma: no cover - queue unbounded by default
+            pass
+
+    def _on_realtime_trade(self, update: BookUpdate) -> None:
+        market_id = self.token_to_market_id.get(update.asset_id)
+        if not market_id:
+            return
+        existing = self.live_state.get(market_id) or LiveMarketState()
+        existing.last_trade_price = update.last_trade_price
+        existing.last_trade_size = update.last_trade_size
+        existing.last_trade_ts = update.last_trade_ts
+        existing.last_update = time.time()
+        self.live_state[market_id] = existing
+        try:
+            self.market_update_queue.put_nowait(market_id)
+        except queue.Full:  # pragma: no cover
+            pass
+
+    def _drain_market_updates(self) -> Set[str]:
+        updates: Set[str] = set()
+        while True:
+            try:
+                updates.add(self.market_update_queue.get_nowait())
+            except queue.Empty:
+                break
+        return updates
+
+    # ------------------------------------------------------------------
     def _get_market_state(self, market: Dict) -> Tuple[Optional[str], LiveMarketState]:
         yes_token, _ = self.fetcher.get_token_ids_for_market(market)
         market_id = market.get("id") or yes_token
@@ -345,17 +442,26 @@ class ProbabilityTradingBot:
 
         cached = self.live_state.get(market_id)
         if cached:
-            # Kill switch if feed is stale
-            if time.time() - cached.last_update > self.bot_config.stale_book_timeout_sec:
+            if self.realtime_client and self.realtime_client.is_healthy():
                 return yes_token, cached
-            return yes_token, cached
+            if time.time() - cached.last_update <= self.bot_config.stale_book_timeout_sec:
+                return yes_token, cached
 
         book = self.fetcher.get_orderbook(yes_token)
         state = LiveMarketState.from_orderbook(book)
         self.live_state[market_id] = state
         return yes_token, state
 
-    def _get_trades_df(self, token_id: str, mid: float) -> pd.DataFrame:
+    def _get_trades_df(self, token_id: str, mid: float, state: Optional[LiveMarketState] = None) -> pd.DataFrame:
+        if state and state.last_trade_ts:
+            return pd.DataFrame(
+                {
+                    "price": [state.last_trade_price if state.last_trade_price is not None else mid],
+                    "size": [state.last_trade_size or 0.0],
+                    "timestamp": [pd.to_datetime(state.last_trade_ts, unit="s")],
+                }
+            )
+
         trades = self.fetcher.get_trades(token_id, limit=200)
         if trades:
             df = self.fetcher.trades_to_dataframe(trades)
@@ -518,7 +624,7 @@ class ProbabilityTradingBot:
             return None
 
         try:
-            trades_df = self._get_trades_df(token_id, state.mid)
+            trades_df = self._get_trades_df(token_id, state.mid, state=state)
             market_state = {
                 "bid": state.bid,
                 "ask": state.ask,
@@ -623,13 +729,24 @@ class ProbabilityTradingBot:
 
     def run_once(self, limit: int = 10) -> List[Dict]:
         markets = self.fetcher.get_markets(limit=limit, order="volume24hr")
+        self._index_markets(markets)
+        if self.realtime_enabled:
+            self._ensure_realtime()
+
         executed: List[Dict] = []
         arb_events = self._evaluate_structural_arbitrage(markets)
+        healthy = self.realtime_client.is_healthy() if self.realtime_client else False
+        target_markets: Set[str] = self._drain_market_updates() if healthy else set()
+        if not healthy:
+            target_markets = {str(m.get("id") or self.fetcher.get_token_ids_for_market(m)[0]) for m in markets}
 
         for market in markets:
             try:
+                market_id = str(market.get("id") or market.get("conditionId") or "")
                 event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId")
                 if event_id and str(event_id) in arb_events:
+                    continue
+                if target_markets and market_id not in target_markets:
                     continue
                 result = self.process_market(market)
                 if result:
@@ -640,4 +757,6 @@ class ProbabilityTradingBot:
 
     def shutdown(self):
         self.risk.cancel_all()
+        if self.realtime_client:
+            self.realtime_client.stop()
 
