@@ -75,6 +75,28 @@ def load_trading_bot_config(path: Path | str = "config/trading_bot_config.yaml")
         cfg.ambiguous_keywords = tuple(cfg.ambiguous_keywords)
 
     cfg.structural_arb = StructuralArbConfig(**structural_payload)
+    arb = cfg.structural_arb
+    depth_band = f"ticks={arb.depth_robustness_ticks},max_extra={arb.depth_robustness_max_extra_cost_abs:.4f}"
+    logger.info(
+        "StructuralArb enabled=%s allow_non_negrisk=%s max_legs=%d min_edge_abs=%.4f edge_buffer=%.4f "
+        "slippage_bps=%d fee_bps=%d max_usdc_event=%.2f max_usdc_cycle=%.2f cooldown=%ds max_batches_per_min=%d "
+        "depth_robust=%s depth_band=%s min_depth_best=%.2f min_depth_band=%.2f",
+        arb.enabled,
+        arb.allow_non_negrisk,
+        arb.max_legs_per_event,
+        arb.min_edge_abs,
+        arb.edge_buffer(),
+        int(arb.slippage_bps),
+        int(arb.fee_bps),
+        arb.max_usdc_per_event,
+        arb.max_usdc_per_cycle,
+        int(arb.cooldown_after_partial_fill_sec),
+        arb.max_batches_per_minute,
+        arb.depth_robustness_enabled,
+        depth_band,
+        arb.min_depth_per_leg_usdc,
+        arb.min_depth_within_band_usdc,
+    )
     return cfg
 
 
