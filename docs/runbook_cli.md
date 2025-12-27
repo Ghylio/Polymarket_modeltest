@@ -23,6 +23,7 @@ This runbook summarizes all discovered command-line interfaces, their options, c
   - `--config` *(Path, default `config/sentiment_config.yaml` if omitted)*.
   - `--once` *(flag)* – run a single iteration.
 - Config: sentiment provider YAML `config/sentiment_config.yaml` loaded by `data.sentiment_config.load_sentiment_config`.
+- Twitter/X free tier safety: defaults keep reads under ~80/month and 3 markets/day with 24h cache + cooldown. Recommended values: `monthly_read_budget=80`, `max_markets_per_day=3`, `query_cache_ttl_hours=24`, `cooldown_hours_per_market=24`.
 - Run locally: `python -m sentiment.ingest --db data/sentiment.db --config config/sentiment_config.yaml --once`
 
 ## Research ingestion service
