@@ -37,7 +37,7 @@ This runbook summarizes all discovered command-line interfaces, their options, c
 - Run locally: `python -m research.ingest --db data/sentiment.db --config config/research_config.yaml --interval_sec 300 --max_markets 50`
 
 ## Snapshot dataset builder
-- Command: `python data/build_snapshots.py`
+- Command: `python -m data.build_snapshots` (legacy: `python data/build_snapshots.py` still works)
 - Options:
   - `--out` *(required str)* – output Parquet path.
   - `--limit` *(int, default=50)* – number of markets.
@@ -47,7 +47,7 @@ This runbook summarizes all discovered command-line interfaces, their options, c
   - `--allow_online_sentiment_fetch` *(flag)* – backfill via providers when local store missing.
   - `--research-db` *(Path, default `data/sentiment.db`)* – research SQLite path.
   - `--use-research` *(flag)* – include research features.
-- Run locally: `python data/build_snapshots.py --out data/features/snapshots.parquet --limit 100 --sentiment-db data/sentiment.db --use-research --research-db data/sentiment.db`
+- Run locally: `python -m data.build_snapshots --out data/features/snapshots.parquet --limit 100 --sentiment-db data/sentiment.db --use-research --research-db data/sentiment.db`
 
 ## Snapshot model trainer
 - Command: `python train_snapshot_model.py`
@@ -59,7 +59,7 @@ This runbook summarizes all discovered command-line interfaces, their options, c
 - Run locally: `python train_snapshot_model.py --snapshots_path data/features/snapshots.parquet --out models/snapshot_model.joblib`
 
 ## Backtester
-- Command: `python backtest/run.py`
+- Command: `python -m backtest.run` (legacy: `python backtest/run.py` still works)
 - Options (required unless noted):
   - `--snapshots` *(required str)* – snapshots parquet path.
   - `--model` *(required str)* – trained model artifact.
@@ -69,15 +69,17 @@ This runbook summarizes all discovered command-line interfaces, their options, c
   - `--slippage_ticks` *(float, default=0.0)*.
   - `--size` *(float, default=1.0)* – position size multiplier.
   - `--disable_gates` *(flag)* – disable evaluation throttles.
-- Run locally: `python backtest/run.py --snapshots data/features/snapshots.parquet --model models/snapshot_model.joblib --out results/backtest`
+- Run locally: `python -m backtest.run --snapshots data/features/snapshots.parquet --model models/snapshot_model.joblib --out results/backtest`
 
 ## Final report generator
 - Command: `python final_report.py`
 - Options: none; prints a progress-style report.
 
 ## Metrics summarizer
-- Command: `python metrics/summarize.py`
-- Options: uses argparse to accept `--runs`, `--out`, and optional filters for metrics (inspect file for details).
+- Command: `python -m metrics.summarize` (legacy: `python metrics/summarize.py` still works)
+- Options:
+  - `--run_dir` *(required str)* – directory containing `metrics.jsonl`.
+- Run locally: `python -m metrics.summarize --run_dir results/backtest`
 
 ## Configuration files
 - YAML files:
@@ -95,7 +97,7 @@ This runbook summarizes all discovered command-line interfaces, their options, c
 - `POLYMARKET_MODELS`: overrides model directory for trading bot.
 - `SENTIMENT_DB` / `RESEARCH_DB`: override SQLite paths for stores.
 - `OPENAI_API_KEY` (plus optional `OPENAI_BASE_URL`, `OPENAI_ORG_ID`): required for research ingestion LLM calls.
-- `CLOB_L1_PRIVATE_KEY`, `CLOB_L2_API_KEY`, `CLOB_L2_API_SECRET` (and any prefixed variants): used by `clob_client.CLOBAuth.load_from_env` when trading bot components interact with the CLOB client.
+- `POLYMARKET_L1_PRIVATE_KEY`, `POLYMARKET_L2_API_KEY`, `POLYMARKET_L2_API_SECRET`: canonical CLOB credentials consumed by `clob_client.ClobAuth.from_env` (other prefixes are only honored if explicitly passed to `from_env`).
 
 ## Help command outputs
 - `python main.py --help` – shows trading bot flags.

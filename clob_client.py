@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 class ClobRequestError(RuntimeError):
@@ -49,11 +53,22 @@ class ClobAuth:
         - ``{prefix}_L2_API_SECRET``
         """
 
-        return cls(
-            os.getenv(f"{prefix}_L1_PRIVATE_KEY"),
-            os.getenv(f"{prefix}_L2_API_KEY"),
-            os.getenv(f"{prefix}_L2_API_SECRET"),
-        )
+        l1 = os.getenv(f"{prefix}_L1_PRIVATE_KEY")
+        l2_key = os.getenv(f"{prefix}_L2_API_KEY")
+        l2_secret = os.getenv(f"{prefix}_L2_API_SECRET")
+
+        detected = [
+            name
+            for name, value in (
+                (f"{prefix}_L1_PRIVATE_KEY", l1),
+                (f"{prefix}_L2_API_KEY", l2_key),
+                (f"{prefix}_L2_API_SECRET", l2_secret),
+            )
+            if value
+        ]
+        logger.info("CLOB auth env keys detected (prefix=%s): %s", prefix, detected or "none")
+
+        return cls(l1, l2_key, l2_secret)
 
     def require_l1(self) -> str:
         if not self.l1_private_key:
