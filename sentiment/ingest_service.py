@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -16,6 +16,7 @@ from data.sentiment_features import SentimentFeatureBuilder, SentimentScorer
 from data.sentiment_providers import SentimentProvider, build_providers_from_config
 from polymarket_fetcher import PolymarketFetcher
 from sentiment.store import DocumentStore, aggregate_scores
+from sentiment.quota_store import TwitterQuotaStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +42,9 @@ class SentimentIngestService:
         self.feature_builder = SentimentFeatureBuilder(
             providers=self.providers, scorer=self.scorer, enabled=True
         )
+        self.twitter_quota_store = TwitterQuotaStore(store.db_path)
+        self._twitter_grant_day: Optional[str] = None
+        self._twitter_granted_cache: Set[str] = set()
 
     # ------------------------------------------------------------------
     def compute_attention_score(self, market: Dict) -> float:
@@ -73,18 +77,77 @@ class SentimentIngestService:
             unique_docs.append(doc)
         return unique_docs
 
-    def fetch_docs_for_market(self, market: Dict, as_of: datetime) -> List[Dict]:
+    def _other_docs_24h(self, market_id: Optional[str], as_of: datetime) -> int:
+        if not market_id:
+            return 0
+        start_ts = int((as_of - timedelta(hours=24)).timestamp())
+        docs = self.store.fetch_docs(market_id, start_ts=start_ts, end_ts=int(as_of.timestamp()))
+        return len([d for d in docs if d["provider"] != "twitter"])
+
+    def fetch_docs_for_market(
+        self,
+        market: Dict,
+        as_of: datetime,
+        twitter_allowlist: Optional[Set[str]] = None,
+        twitter_coverage_blocks: Optional[Set[str]] = None,
+        twitter_other_docs: Optional[Dict[str, int]] = None,
+        twitter_day_key: Optional[str] = None,
+    ) -> List[Dict]:
         all_docs: List[Dict] = []
         queries = self.feature_builder.generate_queries(market)
         if not queries:
             return []
 
+        market_id = market.get("id") or market.get("conditionId")
+        other_docs_24h = (
+            (twitter_other_docs or {}).get(market_id)
+            if twitter_other_docs is not None
+            else None
+        )
+        if other_docs_24h is None:
+            other_docs_24h = self._other_docs_24h(market_id, as_of)
+
+        def _mark_twitter_granted() -> None:
+            if not twitter_day_key or not market_id:
+                return
+            if self._twitter_grant_day != twitter_day_key:
+                self._twitter_grant_day = twitter_day_key
+                self._twitter_granted_cache = set(
+                    self.twitter_quota_store.get_granted_markets(twitter_day_key)
+                )
+            if market_id in self._twitter_granted_cache:
+                return
+            inserted = self.twitter_quota_store.mark_market_granted(
+                twitter_day_key, market_id
+            )
+            if inserted:
+                self._twitter_granted_cache.add(market_id)
+
         for window in [timedelta(days=7), timedelta(days=1), timedelta(hours=6), timedelta(hours=1)]:
             start_time = as_of - window
             for provider in self.providers:
+                if provider.name == "twitter" and twitter_allowlist is not None:
+                    if market_id not in twitter_allowlist:
+                        reason = (
+                            "other_coverage"
+                            if twitter_coverage_blocks and market_id in twitter_coverage_blocks
+                            else "not_allowlisted"
+                        )
+                        LOGGER.info(
+                            "twitter_fetch_skip: %s",
+                            {"market_id": market_id, "reason": reason},
+                        )
+                        continue
+                    _mark_twitter_granted()
                 for query in queries:
                     try:
-                        docs = provider.fetch(query, start_time=start_time, end_time=as_of)
+                        docs = provider.fetch(
+                            query,
+                            start_time=start_time,
+                            end_time=as_of,
+                            market_id=market_id,
+                            other_docs_24h_count=other_docs_24h,
+                        )
                         for idx, doc in enumerate(docs):
                             all_docs.append(
                                 {
@@ -119,6 +182,58 @@ class SentimentIngestService:
     def _bucket_ts(self, as_of: datetime) -> int:
         return int(as_of.replace(minute=0, second=0, microsecond=0).timestamp())
 
+    def _build_twitter_allowlist(
+        self, markets: List[Dict], as_of: datetime
+    ) -> Tuple[Set[str], Dict[str, int], Set[str]]:
+        twitter_provider = next((p for p in self.providers if p.name == "twitter"), None)
+        if not twitter_provider or not getattr(twitter_provider, "enabled", False):
+            return set(), {}, set()
+
+        day_key = as_of.strftime("%Y-%m-%d")
+        existing = self.twitter_quota_store.get_granted_markets(day_key)
+        self._twitter_grant_day = day_key
+        self._twitter_granted_cache = set(existing)
+
+        max_markets = int(
+            getattr(twitter_provider, "config", {}).get(
+                "max_markets_per_day", getattr(twitter_provider, "DEFAULTS", {}).get("max_markets_per_day", 3)
+            )
+        )
+        remaining_slots = max(0, max_markets - len(existing))
+        threshold = int(
+            getattr(twitter_provider, "config", {}).get(
+                "min_other_docs_24h", getattr(twitter_provider, "DEFAULTS", {}).get("min_other_docs_24h", 3)
+            )
+        )
+
+        allowlist: Set[str] = set()
+        coverage_blocks: Set[str] = set()
+        other_docs: Dict[str, int] = {}
+        for market in markets:
+            if remaining_slots <= 0:
+                break
+            market_id = market.get("id") or market.get("conditionId")
+            if not market_id:
+                continue
+            other_docs_count = self._other_docs_24h(market_id, as_of)
+            other_docs[market_id] = other_docs_count
+            if other_docs_count >= threshold:
+                coverage_blocks.add(market_id)
+                continue
+            allowlist.add(market_id)
+            remaining_slots -= 1
+
+        day_remaining = max(0, max_markets - (len(existing) + len(allowlist)))
+        LOGGER.info(
+            "twitter_allowlist_summary: %s",
+            {
+                "twitter_allowlist_size": len(allowlist),
+                "twitter_day_remaining": day_remaining,
+                "skipped_due_to_other_coverage": len(coverage_blocks),
+            },
+        )
+        return allowlist, other_docs, coverage_blocks
+
     def update_aggregates(self, market_id: str, as_of: datetime) -> None:
         bucket_ts = self._bucket_ts(as_of)
         windows = {
@@ -149,15 +264,30 @@ class SentimentIngestService:
             attention_by_cluster.append((key, score, mkts))
 
         attention_by_cluster.sort(key=lambda t: t[1], reverse=True)
+        ordered_markets: List[Dict] = []
+        for _, _, mkts in attention_by_cluster:
+            ordered_markets.extend(mkts)
+
+        twitter_allowlist, twitter_other_docs, twitter_coverage_blocks = self._build_twitter_allowlist(
+            ordered_markets, as_of
+        )
+        day_key = as_of.strftime("%Y-%m-%d") if twitter_allowlist or twitter_coverage_blocks else None
         for _, _, mkts in attention_by_cluster:
             for market in mkts:
-                docs = self.fetch_docs_for_market(market, as_of=as_of)
-                if not docs:
-                    continue
-                inserted = self.store.upsert_documents(docs)
+                docs = self.fetch_docs_for_market(
+                    market,
+                    as_of=as_of,
+                    twitter_allowlist=twitter_allowlist,
+                    twitter_coverage_blocks=twitter_coverage_blocks,
+                    twitter_other_docs=twitter_other_docs,
+                    twitter_day_key=day_key,
+                )
+                inserted = self.store.upsert_documents(docs) if docs else 0
                 if inserted:
                     LOGGER.info("Stored %s new docs for %s", inserted, market.get("id"))
-                self.update_aggregates(market_id=market.get("id") or market.get("conditionId"), as_of=as_of)
+                market_id = market.get("id") or market.get("conditionId")
+                if market_id:
+                    self.update_aggregates(market_id=market_id, as_of=as_of)
 
     def run_forever(self) -> None:
         while True:

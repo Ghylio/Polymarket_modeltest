@@ -50,7 +50,19 @@ def load_sentiment_config(path: Path | None = None) -> Dict[str, Any]:
         "providers": {
             "gdelt": providers.get("gdelt") or {"enabled": False},
             "newsapi": providers.get("newsapi") or {"enabled": False, "api_key": ""},
-            "twitter": providers.get("twitter") or {"enabled": False, "bearer_token": ""},
+            "twitter": providers.get("twitter")
+            or {
+                "enabled": False,
+                "bearer_token": "",
+                "monthly_read_budget": 80,
+                "max_markets_per_day": 3,
+                "query_cache_ttl_hours": 24,
+                "cooldown_hours_per_market": 24,
+                "max_results_per_query": 10,
+                "min_other_docs_24h": 3,
+                "lang": "en",
+                "exclude_retweets": True,
+            },
         },
         "sentiment": {
             "enabled": bool(sentiment.get("enabled", False)),
