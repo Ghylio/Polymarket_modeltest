@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -56,7 +57,11 @@ class StructuralArbConfig:
 
     def __post_init__(self) -> None:
         if self.max_legs_per_event > 15:
-            raise ValueError("max_legs_per_event cannot exceed batch limit of 15")
+            original = self.max_legs_per_event
+            self.max_legs_per_event = 15
+            logging.getLogger(__name__).warning(
+                "max_legs_per_event %s exceeds batch limit; clamping to 15", original
+            )
 
     # ------------------------------------------------------------------
     # Helpers / legacy aliases

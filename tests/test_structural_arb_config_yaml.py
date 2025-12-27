@@ -1,3 +1,5 @@
+import io
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +23,7 @@ class StructuralArbConfigLoadTest(unittest.TestCase):
         self.assertEqual(arb.depth_robustness_ticks, 1)
         self.assertAlmostEqual(arb.depth_robustness_max_extra_cost_abs, 0.01)
 
-    def test_validation_rejects_too_many_legs(self):
+    def test_clamps_too_many_legs_and_logs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "config.yaml"
             path.write_text(
@@ -29,13 +31,28 @@ class StructuralArbConfigLoadTest(unittest.TestCase):
                     {
                         "structural_arb": {
                             "enabled": True,
-                            "max_legs_per_event": 20,
+                            "max_legs_per_event": 999,
                         }
                     }
                 )
             )
-            with self.assertRaises(ValueError):
-                load_trading_bot_config(path)
+
+            stream = io.StringIO()
+            logger = logging.getLogger("trading_bot")
+            handler = logging.StreamHandler(stream)
+            original_level = logger.level
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            try:
+                cfg = load_trading_bot_config(path)
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(original_level)
+
+            self.assertEqual(cfg.structural_arb.max_legs_per_event, 15)
+            logs = stream.getvalue()
+            self.assertIn("StructuralArb enabled=True", logs)
+            self.assertIn("max_legs=15", logs)
 
 
 if __name__ == "__main__":
