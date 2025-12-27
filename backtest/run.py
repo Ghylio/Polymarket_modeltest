@@ -555,7 +555,7 @@ class BacktestRunner:
             logger.info("Parquet outputs skipped (engine missing)")
 
 
-def main():  # pragma: no cover - CLI wrapper
+def main(argv: Optional[List[str]] = None) -> None:  # pragma: no cover - CLI wrapper
     import argparse
 
     parser = argparse.ArgumentParser(description="Replay backtester over snapshots")
@@ -568,7 +568,7 @@ def main():  # pragma: no cover - CLI wrapper
     parser.add_argument("--size", type=float, default=1.0)
     parser.add_argument("--disable_gates", action="store_true", help="Disable eval throttles")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config = BacktestConfig(
         threshold=args.threshold,
         slippage_bps=args.slippage_bps,
